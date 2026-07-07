@@ -1,464 +1,470 @@
 """
-SLATE — a subcontractor bid & endorsement platform (prototype)
-==============================================================
+SLATE — subcontractor bid & endorsement platform (PILOT)
+========================================================
 Built by contractors, for contractors.
 
-This is a clickable PROTOTYPE built in Streamlit (pure Python).
-Nothing here talks to a real database yet — all data is mock data
-defined in the DATA section below so you can demo the experience
-and get reactions from GCs and subs before building a real backend.
+This version is wired to real services:
+  - Supabase ......... login/accounts, database, file storage
+  - Resend ........... email notifications to subs when an ITB goes out
 
-HOW TO EDIT (the parts you'll actually touch):
-  - Change companies/metrics ......... edit the SUBS list
-  - Change open bid requests ......... edit the ITBS list
-  - Change tier rules/labels ......... edit TIER_META
-  - Change colors .................... edit the C dict
-  - Change wording ................... it's all inline, search the text
+SETUP (one time) — see README.md for the click-by-click version:
+  1. Create a free project at supabase.com
+  2. Run schema.sql in the Supabase SQL Editor
+  3. Supabase -> Authentication -> Sign In / Up: turn OFF "Confirm email"
+     (pilot convenience; turn back on later)
+  4. Create a free account at resend.com, get an API key
+  5. Put your keys in .streamlit/secrets.toml (locally) or in the
+     Streamlit Cloud "Secrets" box (deployed). See secrets.toml.example.
 
-HOW TO RUN LOCALLY:
-  pip install -r requirements.txt
-  streamlit run app.py
+HOW IT WORKS:
+  - New users sign up with email + password, then complete a profile
+    as either a GC or a Sub.
+  - GCs create bid requests (ITBs): scope + due date + PDF drawings,
+    pick subs from the network, hit send. Each sub gets an email and
+    an in-app invite.
+  - Subs see their invite inbox, download drawings via expiring signed
+    links, and respond with a bid amount + note.
+  - GCs see responses side by side per ITB.
 
-HOW TO PUBLISH (free):
-  1. Push this repo to GitHub
-  2. Go to share.streamlit.io -> "New app" -> pick your repo
-  3. Set the main file to app.py -> Deploy. You get a public URL.
+The demo with mock data still lives in demo_app.py.
 """
 
+import mimetypes
+import time
+
+import requests
 import streamlit as st
+from supabase import create_client
 
-# ─────────────────────────────────────────────────────────────────────────
-#  PALETTE  — construction / drafting theme. Change these hex values to
-#  rebrand the whole app.
-# ─────────────────────────────────────────────────────────────────────────
-C = {
-    "paper":   "#EDEFEA",   # drafting-paper background
-    "ink":     "#16263C",   # navy — primary text / sidebar
-    "inkSoft": "#3D4E63",   # muted labels
-    "line":    "#C6CCC4",   # borders
-    "orange":  "#E8621A",   # safety orange — accents / primary buttons
-    "blue":    "#2E5E8C",   # tier 2
-    "green":   "#3E7A4E",   # tier 3 / good metrics
-    "white":   "#FAFBF8",   # card background
-}
-
-# ─────────────────────────────────────────────────────────────────────────
-#  DATA  — mock data. This is the part you'll edit most.
-# ─────────────────────────────────────────────────────────────────────────
-SUBS = [
-    {"id": 1, "name": "Morgado Building & Renovation", "trade": "General / Framing", "tier": 3,
-     "endorsements": 14, "onTime": 96, "responseRate": 92, "bidVariance": "+2.1%", "capacity": "Open",
-     "crews": 3, "maxScope": "$1.5M", "region": "South Bay", "years": 18,
-     "note": "Consistently closes punch lists inside 5 days. Zero disputed change orders in 24 mo."},
-    {"id": 2, "name": "Reyes Electric Co.", "trade": "Electrical (C-10)", "tier": 3,
-     "endorsements": 11, "onTime": 94, "responseRate": 88, "bidVariance": "-1.4%", "capacity": "Open",
-     "crews": 4, "maxScope": "$900K", "region": "San Jose / Peninsula", "years": 12,
-     "note": "Strong on service upgrades + ADU subpanels. Fast RFI turnaround."},
-    {"id": 3, "name": "Bayline Plumbing & Rough-In", "trade": "Plumbing (C-36)", "tier": 2,
-     "endorsements": 6, "onTime": 89, "responseRate": 95, "bidVariance": "+4.8%", "capacity": "Tight",
-     "crews": 2, "maxScope": "$400K", "region": "South Bay", "years": 9,
-     "note": "High response rate. Bids trend above budget on hillside work."},
-    {"id": 4, "name": "Sierra Concrete & Grading", "trade": "Concrete / Grading (C-8)", "tier": 2,
-     "endorsements": 7, "onTime": 91, "responseRate": 81, "bidVariance": "+0.9%", "capacity": "Open",
-     "crews": 5, "maxScope": "$1.2M", "region": "Santa Clara County", "years": 21,
-     "note": "Handles engineered pads + retaining. Slower to respond, reliable once mobilized."},
-    {"id": 5, "name": "Vu Mechanical (HVAC)", "trade": "HVAC (C-20)", "tier": 1,
-     "endorsements": 2, "onTime": 84, "responseRate": 90, "bidVariance": "-3.2%", "capacity": "Open",
-     "crews": 1, "maxScope": "$150K", "region": "San Jose", "years": 4,
-     "note": "Newer shop, competitive pricing. Needs 1 more endorsement for Tier 2."},
-    {"id": 6, "name": "Golden State Drywall", "trade": "Drywall (C-9)", "tier": 1,
-     "endorsements": 1, "onTime": 78, "responseRate": 72, "bidVariance": "+6.5%", "capacity": "Booked",
-     "crews": 2, "maxScope": "$200K", "region": "East Bay / South Bay", "years": 6,
-     "note": "Two late finishes flagged in last 12 mo. Currently booked through Sept."},
-]
-
-ITBS = [
-    {"id": "ITB-0142", "project": "Lariat Ln Residence — 3,750 SF New Build", "trade": "Concrete / Grading",
-     "due": "Jul 18", "sent": 6, "responded": 4, "status": "Open", "coverage": 67},
-    {"id": "ITB-0141", "project": "Lariat Ln Residence — 3,750 SF New Build", "trade": "Framing Package",
-     "due": "Jul 21", "sent": 4, "responded": 1, "status": "Open", "coverage": 25},
-    {"id": "ITB-0139", "project": "Westview Dr Spec — Site Prep", "trade": "Electrical",
-     "due": "Jul 10", "sent": 5, "responded": 5, "status": "Leveling", "coverage": 100},
-]
-
-TIER_META = {
-    1: {"label": "TIER 1", "sub": "Verified license + insurance",          "color": C["inkSoft"], "max": "Scopes to $250K"},
-    2: {"label": "TIER 2", "sub": "3+ GC endorsements",                    "color": C["blue"],    "max": "Scopes to $750K"},
-    3: {"label": "TIER 3", "sub": "8+ endorsements · audited history",     "color": C["green"],   "max": "Unlimited scope access"},
-}
-
-# ─────────────────────────────────────────────────────────────────────────
-#  PAGE CONFIG + CSS  — the injected CSS gets us close to the SLATE look.
-#  You rarely need to touch this block.
-# ─────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+#  CONFIG + THEME
+# ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="SLATE", page_icon="🪧", layout="wide")
 
-CSS = """
+C = {
+    "paper": "#EDEFEA", "ink": "#16263C", "inkSoft": "#3D4E63",
+    "line": "#C6CCC4", "orange": "#E8621A", "blue": "#2E5E8C",
+    "green": "#3E7A4E", "white": "#FAFBF8",
+}
+
+st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Barlow:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
-
-/* App background = drafting paper */
 .stApp { background: #EDEFEA; }
-
-/* Typography helpers */
 .f-disp { font-family: 'Barlow Condensed', sans-serif; }
 .f-mono { font-family: 'IBM Plex Mono', monospace; }
 html, body, [class*="css"] { font-family: 'Barlow', sans-serif; }
-
-/* Sidebar = navy ink */
 section[data-testid="stSidebar"] { background: #16263C; }
 section[data-testid="stSidebar"] * { color: #C6D0DC; }
-
-/* Card primitive */
-.card {
-  background: #FAFBF8; border: 1px solid #C6CCC4; border-radius: 3px;
-  padding: 16px; margin-bottom: 12px;
-}
+.card { background:#FAFBF8; border:1px solid #C6CCC4; border-radius:3px;
+        padding:16px; margin-bottom:12px; }
 .wordmark { font-family:'Barlow Condensed',sans-serif; font-weight:700;
-  font-size: 30px; color:#FFFFFF; letter-spacing:0.5px; line-height:1; }
+            font-size:30px; color:#FFF; letter-spacing:0.5px; line-height:1; }
 .eyebrow { font-family:'IBM Plex Mono',monospace; font-size:10px;
-  text-transform:uppercase; letter-spacing:1px; color:#3D4E63; }
-.metric-val { font-family:'Barlow Condensed',sans-serif; font-weight:600; font-size:26px; }
-.stamp { display:inline-block; border:2px solid; border-radius:4px;
-  padding:2px 10px; transform:rotate(-4deg); font-family:'Barlow Condensed',sans-serif;
-  font-weight:700; letter-spacing:2px; font-size:13px; }
-
-/* Primary buttons -> safety orange */
-.stButton > button {
-  background:#E8621A; color:#FFFFFF; border:none; border-radius:3px;
-  font-family:'Barlow Condensed',sans-serif; font-weight:600; letter-spacing:1px;
-}
-.stButton > button:hover { background:#cf560f; color:#FFFFFF; }
+           text-transform:uppercase; letter-spacing:1px; color:#3D4E63; }
+.stButton > button { background:#E8621A; color:#FFF; border:none; border-radius:3px;
+  font-family:'Barlow Condensed',sans-serif; font-weight:600; letter-spacing:1px; }
+.stButton > button:hover { background:#cf560f; color:#FFF; }
 </style>
-"""
-st.markdown(CSS, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────
-#  SMALL HTML HELPERS  — return strings we drop in with st.markdown.
-# ─────────────────────────────────────────────────────────────────────────
-def tier_stamp(tier: int) -> str:
-    m = TIER_META[tier]
-    return f'<span class="stamp" style="border-color:{m["color"]};color:{m["color"]}">{m["label"]}</span>'
+def heading(text):
+    st.markdown(f'<div class="f-disp" style="font-size:30px;font-weight:700;'
+                f'color:{C["ink"]}">{text}</div>', unsafe_allow_html=True)
 
 
-def metric_block(label: str, value: str, warn: bool = False) -> str:
-    color = C["orange"] if warn else C["ink"]
-    return (f'<div class="eyebrow">{label}</div>'
-            f'<div class="metric-val" style="color:{color}">{value}</div>')
+# ─────────────────────────────────────────────────────────────────────
+#  SUPABASE CLIENT + AUTH HELPERS
+# ─────────────────────────────────────────────────────────────────────
+@st.cache_resource
+def get_client():
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_ANON_KEY"])
 
 
-def coverage_bar(pct: int) -> str:
-    color = C["orange"] if pct < 40 else C["green"]
-    return (f'<div style="background:{C["paper"]};height:6px;border-radius:3px;margin-top:4px">'
-            f'<div style="width:{pct}%;height:6px;border-radius:3px;background:{color}"></div></div>')
+def sb():
+    """Client authorized as the logged-in user (so RLS policies apply)."""
+    client = get_client()
+    tok = st.session_state.get("access_token")
+    if tok:
+        client.postgrest.auth(tok)
+    return client
 
 
-# ─────────────────────────────────────────────────────────────────────────
-#  SIDEBAR / NAVIGATION
-# ─────────────────────────────────────────────────────────────────────────
+def require_secrets():
+    missing = [k for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY") if k not in st.secrets]
+    if missing:
+        st.error(f"Missing secrets: {', '.join(missing)}. "
+                 "Add them to .streamlit/secrets.toml (local) or the Secrets box "
+                 "on Streamlit Cloud. See README.md.")
+        st.stop()
+
+
+def sign_in(email, password):
+    res = get_client().auth.sign_in_with_password({"email": email, "password": password})
+    st.session_state.access_token = res.session.access_token
+    st.session_state.user_id = res.user.id
+    st.session_state.user_email = res.user.email
+
+
+def sign_up(email, password):
+    res = get_client().auth.sign_up({"email": email, "password": password})
+    if res.session is None:
+        # Email confirmation is still ON in Supabase settings.
+        st.info("Account created. Confirm the email Supabase sent you, then log in. "
+                "(To skip this step for the pilot, turn off 'Confirm email' in "
+                "Supabase -> Authentication settings.)")
+        st.stop()
+    st.session_state.access_token = res.session.access_token
+    st.session_state.user_id = res.user.id
+    st.session_state.user_email = res.user.email
+
+
+def sign_out():
+    for k in ("access_token", "user_id", "user_email", "profile"):
+        st.session_state.pop(k, None)
+
+
+def load_profile():
+    rows = (sb().table("profiles").select("*")
+            .eq("id", st.session_state.user_id).execute().data)
+    st.session_state.profile = rows[0] if rows else None
+    return st.session_state.profile
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  EMAIL (Resend) — degrades gracefully if no key is configured
+# ─────────────────────────────────────────────────────────────────────
+def send_itb_email(to_email, gc_company, project, trade, due, app_url):
+    api_key = st.secrets.get("RESEND_API_KEY")
+    if not api_key:
+        return False, "no RESEND_API_KEY configured"
+    try:
+        r = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "from": st.secrets.get("EMAIL_FROM", "SLATE <onboarding@resend.dev>"),
+                "to": [to_email],
+                "subject": f"Bid request: {trade} — {project}",
+                "html": (
+                    f"<p><b>{gc_company}</b> invited you to bid on:</p>"
+                    f"<p><b>{project}</b><br>Trade: {trade}<br>Bids due: {due}</p>"
+                    f"<p>Drawings and scope are attached in SLATE. "
+                    f"<a href='{app_url}'>Log in to review and respond</a>.</p>"
+                    f"<p style='color:#888;font-size:12px'>SLATE — by contractors, "
+                    f"for contractors.</p>"
+                ),
+            },
+            timeout=15,
+        )
+        return (r.status_code in (200, 201)), r.text
+    except requests.RequestException as e:
+        return False, str(e)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  SCREEN: LOGIN / SIGN UP
+# ─────────────────────────────────────────────────────────────────────
+def screen_auth():
+    st.markdown('<div class="wordmark" style="color:#16263C">SLATE'
+                '<span style="color:#E8621A">.</span></div>', unsafe_allow_html=True)
+    st.markdown('<div class="eyebrow">BY CONTRACTORS, FOR CONTRACTORS</div>',
+                unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    tab_in, tab_up = st.tabs(["Log in", "Create account"])
+    with tab_in:
+        email = st.text_input("Email", key="li_email")
+        pw = st.text_input("Password", type="password", key="li_pw")
+        if st.button("Log in"):
+            try:
+                sign_in(email.strip(), pw)
+                st.rerun()
+            except Exception:
+                st.error("Login failed — check your email and password.")
+    with tab_up:
+        email = st.text_input("Email", key="su_email")
+        pw = st.text_input("Password (8+ characters)", type="password", key="su_pw")
+        if st.button("Create account"):
+            if len(pw) < 8:
+                st.error("Password needs at least 8 characters.")
+            else:
+                try:
+                    sign_up(email.strip(), pw)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not create the account: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  SCREEN: COMPLETE PROFILE (first login)
+# ─────────────────────────────────────────────────────────────────────
+def screen_onboarding():
+    heading("SET UP YOUR PROFILE")
+    role = st.radio("I am a…", ["General Contractor", "Subcontractor"], horizontal=True)
+    company = st.text_input("Company name")
+    trade, license_no = None, None
+    if role == "Subcontractor":
+        trade = st.text_input("Trade + license class (e.g. Electrical C-10)")
+        license_no = st.text_input("CSLB license #")
+    region = st.text_input("Region (e.g. South Bay)")
+    if st.button("Save profile"):
+        if not company.strip():
+            st.error("Company name is required.")
+            return
+        sb().table("profiles").insert({
+            "id": st.session_state.user_id,
+            "email": st.session_state.user_email,
+            "role": "gc" if role == "General Contractor" else "sub",
+            "company": company.strip(),
+            "trade": (trade or "").strip() or None,
+            "license_no": (license_no or "").strip() or None,
+            "region": region.strip() or None,
+        }).execute()
+        st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  GC SCREEN: NEW BID REQUEST  (create ITB -> upload files -> invite -> email)
+# ─────────────────────────────────────────────────────────────────────
+def screen_new_itb(profile):
+    heading("NEW BID REQUEST")
+
+    subs = (sb().table("profiles").select("id, company, trade, region, email")
+            .eq("role", "sub").execute().data)
+    if not subs:
+        st.info("No subcontractors have joined yet. Invite your subs to create "
+                "accounts — this screen goes live the moment the first one signs up.")
+        return
+
+    project = st.text_input("Project", placeholder="Lariat Ln Residence — 3,750 SF New Build")
+    trade = st.text_input("Trade package", placeholder="Framing Package")
+    scope = st.text_area("Scope of work")
+    due = st.date_input("Bids due")
+    files = st.file_uploader("Drawings / scope docs (PDF, DOCX)",
+                             accept_multiple_files=True)
+
+    st.markdown('<div class="eyebrow" style="margin-top:8px">SELECT SUBS</div>',
+                unsafe_allow_html=True)
+    picked = []
+    for s in subs:
+        label = f"{s['company']} — {s.get('trade') or 'trade not set'} · {s.get('region') or ''}"
+        if st.checkbox(label, key=f"sub_{s['id']}"):
+            picked.append(s)
+
+    if st.button("Send Bid Request"):
+        if not (project.strip() and trade.strip() and picked):
+            st.error("Project, trade package, and at least one sub are required.")
+            return
+
+        with st.spinner("Creating bid request…"):
+            # 1. the ITB row
+            itb = (sb().table("itbs").insert({
+                "gc_id": st.session_state.user_id,
+                "project": project.strip(),
+                "trade": trade.strip(),
+                "scope": scope.strip() or None,
+                "due_date": due.isoformat(),
+            }).execute().data)[0]
+
+            # 2. upload files to the private bucket, record paths
+            for f in files or []:
+                path = f"{itb['id']}/{int(time.time())}_{f.name}"
+                mime = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
+                sb().storage.from_("drawings").upload(
+                    path, f.getvalue(), {"content-type": mime})
+                sb().table("itb_files").insert({
+                    "itb_id": itb["id"], "path": path, "filename": f.name,
+                }).execute()
+
+            # 3. invites + emails
+            app_url = st.secrets.get("APP_URL", "https://share.streamlit.io")
+            emailed, failed = 0, 0
+            for s in picked:
+                sb().table("itb_invites").insert({
+                    "itb_id": itb["id"], "sub_id": s["id"],
+                }).execute()
+                ok, _ = send_itb_email(s["email"], profile["company"],
+                                       project, trade, due.isoformat(), app_url)
+                emailed += ok
+                failed += (not ok)
+
+        st.success(f"Bid request sent to {len(picked)} sub(s). "
+                   f"Emails delivered: {emailed}."
+                   + (f" Email failures: {failed} — invites still show in their "
+                      f"SLATE inbox." if failed else ""))
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  GC SCREEN: DASHBOARD  (my ITBs + responses side by side)
+# ─────────────────────────────────────────────────────────────────────
+def screen_gc_dashboard(profile):
+    heading("DASHBOARD")
+    itbs = (sb().table("itbs").select("*")
+            .eq("gc_id", st.session_state.user_id)
+            .order("created_at", desc=True).execute().data)
+    if not itbs:
+        st.info("No bid requests yet — create your first one from **New Bid Request**.")
+        return
+
+    for itb in itbs:
+        invites = (sb().table("itb_invites").select("sub_id, status")
+                   .eq("itb_id", itb["id"]).execute().data)
+        bids = (sb().table("bids").select("sub_id, amount, note, created_at")
+                .eq("itb_id", itb["id"]).order("amount").execute().data)
+        responded = sum(1 for v in invites if v["status"] == "responded")
+        with st.expander(f"ITB-{itb['id']:04d} · {itb['project']} — {itb['trade']} "
+                         f"({responded}/{len(invites)} responded, due {itb['due_date']})"):
+            if itb.get("scope"):
+                st.markdown(f'<div class="eyebrow">SCOPE</div>'
+                            f'<div style="color:{C["ink"]}">{itb["scope"]}</div>',
+                            unsafe_allow_html=True)
+            if not bids:
+                st.markdown(f'<div style="color:{C["inkSoft"]}">No bids yet.</div>',
+                            unsafe_allow_html=True)
+                continue
+            # look up company names for the bids
+            ids = [b["sub_id"] for b in bids]
+            names = {p["id"]: p["company"] for p in
+                     sb().table("profiles").select("id, company")
+                     .in_("id", ids).execute().data}
+            low = min(b["amount"] for b in bids)
+            for b in bids:
+                tag = (' <span class="f-mono" style="color:#3E7A4E;font-size:11px">'
+                       'LOW BID</span>' if b["amount"] == low and len(bids) > 1 else "")
+                st.markdown(
+                    f'<div class="card"><b>{names.get(b["sub_id"], "Sub")}</b> — '
+                    f'<span class="f-disp" style="font-size:20px;font-weight:600">'
+                    f'${b["amount"]:,.0f}</span>{tag}'
+                    f'<div style="color:{C["inkSoft"]};font-size:14px">'
+                    f'{b.get("note") or ""}</div></div>',
+                    unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  SUB SCREEN: INBOX  (my invites -> download drawings -> respond)
+# ─────────────────────────────────────────────────────────────────────
+def screen_sub_inbox(profile):
+    heading("BID INVITES")
+    invites = (sb().table("itb_invites").select("*")
+               .eq("sub_id", st.session_state.user_id)
+               .order("created_at", desc=True).execute().data)
+    if not invites:
+        st.info("No bid invites yet. When a GC sends you one, it lands here "
+                "and in your email.")
+        return
+
+    for v in invites:
+        itb = (sb().table("itbs").select("*").eq("id", v["itb_id"]).execute().data)
+        if not itb:
+            continue
+        itb = itb[0]
+        gc = (sb().table("profiles").select("company")
+              .eq("id", itb["gc_id"]).execute().data)
+        gc_name = gc[0]["company"] if gc else "GC"
+        badge = "✅ RESPONDED" if v["status"] == "responded" else "🟠 AWAITING YOUR BID"
+
+        with st.expander(f"{badge} · {itb['project']} — {itb['trade']} "
+                         f"(from {gc_name}, due {itb['due_date']})"):
+            if itb.get("scope"):
+                st.markdown(f'<div class="eyebrow">SCOPE</div>'
+                            f'<div style="color:{C["ink"]}">{itb["scope"]}</div>',
+                            unsafe_allow_html=True)
+
+            # drawings via short-lived signed URLs (private bucket)
+            fs = (sb().table("itb_files").select("path, filename")
+                  .eq("itb_id", itb["id"]).execute().data)
+            if fs:
+                st.markdown('<div class="eyebrow" style="margin-top:8px">DRAWINGS'
+                            '</div>', unsafe_allow_html=True)
+                for f in fs:
+                    try:
+                        signed = sb().storage.from_("drawings").create_signed_url(
+                            f["path"], 3600)
+                        url = signed.get("signedURL") or signed.get("signed_url")
+                        st.markdown(f"- [{f['filename']}]({url})")
+                    except Exception:
+                        st.markdown(f"- {f['filename']} (link unavailable)")
+
+            if v["status"] != "responded":
+                amount = st.number_input("Your bid ($)", min_value=0.0, step=1000.0,
+                                         key=f"amt_{v['id']}")
+                note = st.text_area("Notes (inclusions, exclusions, lead time)",
+                                    key=f"note_{v['id']}")
+                if st.button("Submit bid", key=f"send_{v['id']}"):
+                    if amount <= 0:
+                        st.error("Enter a bid amount.")
+                    else:
+                        sb().table("bids").insert({
+                            "itb_id": itb["id"],
+                            "sub_id": st.session_state.user_id,
+                            "amount": amount,
+                            "note": note.strip() or None,
+                        }).execute()
+                        sb().table("itb_invites").update(
+                            {"status": "responded"}).eq("id", v["id"]).execute()
+                        st.success("Bid submitted.")
+                        st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  SHARED SCREEN: SUB NETWORK (GC view of registered subs)
+# ─────────────────────────────────────────────────────────────────────
+def screen_network():
+    heading("SUB NETWORK")
+    subs = (sb().table("profiles").select("company, trade, region, license_no")
+            .eq("role", "sub").order("company").execute().data)
+    if not subs:
+        st.info("No subs registered yet.")
+        return
+    for s in subs:
+        st.markdown(
+            f'<div class="card"><b>{s["company"]}</b>'
+            f'<div class="f-mono" style="font-size:11px;color:{C["inkSoft"]}">'
+            f'{s.get("trade") or "trade not set"} · {s.get("region") or ""} · '
+            f'CSLB {s.get("license_no") or "—"}</div></div>',
+            unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  MAIN ROUTER
+# ─────────────────────────────────────────────────────────────────────
+require_secrets()
+
+if "user_id" not in st.session_state:
+    screen_auth()
+    st.stop()
+
+profile = st.session_state.get("profile") or load_profile()
+if profile is None:
+    screen_onboarding()
+    st.stop()
+
 with st.sidebar:
     st.markdown('<div class="wordmark">SLATE<span style="color:#E8621A">.</span></div>',
                 unsafe_allow_html=True)
-    st.markdown('<div class="f-mono" style="font-size:9px;color:#8FA0B5;margin-top:4px">'
-                'BY CONTRACTORS, FOR CONTRACTORS</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="f-mono" style="font-size:10px;color:#8FA0B5;'
+                f'margin-top:4px">{profile["company"].upper()} · '
+                f'{"GC" if profile["role"] == "gc" else "SUB"}</div>',
+                unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
-
-    page = st.radio(
-        "Navigate",
-        ["Dashboard", "Sub Network", "New Bid Request", "Tier System"],
-        label_visibility="collapsed",
-    )
-
+    if profile["role"] == "gc":
+        page = st.radio("Navigate", ["Dashboard", "New Bid Request", "Sub Network"],
+                        label_visibility="collapsed")
+    else:
+        page = st.radio("Navigate", ["Bid Invites"], label_visibility="collapsed")
     st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown('<div class="f-mono" style="font-size:11px;color:#8FA0B5">'
-                'ALUM ROCK DEVELOPMENT GROUP</div>', unsafe_allow_html=True)
-    st.markdown('<div class="f-mono" style="font-size:11px;color:#8FA0B5">'
-                'GC PREMIUM · $500/mo</div>', unsafe_allow_html=True)
+    if st.button("Log out"):
+        sign_out()
+        st.rerun()
 
-
-# ─────────────────────────────────────────────────────────────────────────
-#  PAGE: DASHBOARD
-# ─────────────────────────────────────────────────────────────────────────
-def page_dashboard():
-    st.markdown('<div class="f-disp" style="font-size:30px;font-weight:700;color:#16263C">'
-                'DASHBOARD</div>', unsafe_allow_html=True)
-
-    # Top metrics row
-    cols = st.columns(4)
-    stats = [("Open bid requests", "3"), ("Avg. bid coverage", "64%"),
-             ("Subs in network", "38"), ("Endorsements given", "14")]
-    for col, (label, val) in zip(cols, stats):
-        with col:
-            st.markdown(f'<div class="card">{metric_block(label, val)}</div>',
-                        unsafe_allow_html=True)
-
-    st.markdown('<div class="f-disp" style="font-size:22px;font-weight:700;color:#16263C;'
-                'margin-top:8px">ACTIVE BID REQUESTS</div>', unsafe_allow_html=True)
-
-    for b in ITBS:
-        status_color = C["blue"] if b["status"] == "Leveling" else C["green"]
-        html = f"""
-        <div class="card">
-          <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center">
-            <span class="f-mono" style="font-size:11px;background:{C['paper']};
-                  padding:3px 8px;border-radius:3px;color:{C['inkSoft']}">{b['id']}</span>
-            <div style="flex:1;min-width:180px">
-              <div style="font-weight:600;color:{C['ink']}">{b['project']}</div>
-              <div class="f-mono" style="font-size:11px;color:{C['inkSoft']}">
-                   {b['trade']} · due {b['due']}</div>
-            </div>
-            <div style="width:150px">
-              <div class="f-mono" style="font-size:11px;color:{C['inkSoft']}">
-                   {b['responded']}/{b['sent']} responded</div>
-              {coverage_bar(b['coverage'])}
-            </div>
-            <span class="f-disp" style="font-weight:600;color:{status_color};
-                  border:1px solid {C['line']};padding:1px 8px;border-radius:3px">
-                  {b['status'].upper()}</span>
-          </div>
-        </div>"""
-        st.markdown(html, unsafe_allow_html=True)
-
-    # Coverage-risk alert — the "we know your real pain" feature
-    st.markdown(f"""
-    <div class="card" style="border-color:{C['orange']}">
-      <span style="color:{C['ink']}"><b>⚠ Coverage risk:</b> Framing package (ITB-0141)
-      has 25% response with 14 days to due date. 2 Tier-3 framing subs with open capacity
-      match this scope — open <b>Sub Network</b> to view matches.</span>
-    </div>""", unsafe_allow_html=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────
-#  PAGE: SUB NETWORK
-# ─────────────────────────────────────────────────────────────────────────
-def page_subs():
-    st.markdown('<div class="f-disp" style="font-size:30px;font-weight:700;color:#16263C">'
-                'SUB NETWORK</div>', unsafe_allow_html=True)
-
-    query = st.text_input("Search", placeholder="Search trade or company…",
-                          label_visibility="collapsed")
-    results = [s for s in SUBS
-               if query.lower() in (s["name"] + s["trade"]).lower()]
-
-    left, right = st.columns([3, 2])
-
-    # Left: the list. Streamlit reruns on click, so we track selection in session_state.
-    if "selected_sub" not in st.session_state:
-        st.session_state.selected_sub = SUBS[0]["id"]
-
-    with left:
-        for s in results:
-            cap_color = {"Open": C["green"], "Tight": C["orange"]}.get(s["capacity"], C["inkSoft"])
-            ot_color = C["green"] if s["onTime"] >= 90 else C["orange"]
-            st.markdown(f"""
-            <div class="card">
-              <div style="display:flex;align-items:center;gap:12px">
-                <div style="flex:1">
-                  <div style="font-weight:600;color:{C['ink']}">{s['name']}</div>
-                  <div class="f-mono" style="font-size:11px;color:{C['inkSoft']}">
-                       {s['trade']} · {s['region']}</div>
-                  <div class="f-mono" style="font-size:11px;color:{C['inkSoft']};margin-top:6px">
-                    ON-TIME <b style="color:{ot_color}">{s['onTime']}%</b> &nbsp;
-                    RESPONSE <b style="color:{C['ink']}">{s['responseRate']}%</b> &nbsp;
-                    CAPACITY <b style="color:{cap_color}">{s['capacity'].upper()}</b>
-                  </div>
-                </div>
-                {tier_stamp(s['tier'])}
-              </div>
-            </div>""", unsafe_allow_html=True)
-            # A button under each card sets the selected sub for the detail pane.
-            if st.button(f"View {s['name']}", key=f"view_{s['id']}"):
-                st.session_state.selected_sub = s["id"]
-
-    # Right: detail pane for the currently selected sub.
-    with right:
-        sel = next(s for s in SUBS if s["id"] == st.session_state.selected_sub)
-        m = TIER_META[sel["tier"]]
-        var_warn = sel["bidVariance"].startswith("+") and float(sel["bidVariance"].strip("+%")) > 4
-        st.markdown(f"""
-        <div class="card" style="border-color:{C['ink']}">
-          <div class="f-disp" style="font-size:22px;font-weight:700;color:{C['ink']}">{sel['name']}</div>
-          <div class="f-mono" style="font-size:11px;color:{C['inkSoft']}">
-               {sel['trade']} · {sel['years']} yrs · {sel['crews']} crews</div>
-          <hr style="border-color:{C['line']}">
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
-            <div>{metric_block("On-time finish", str(sel['onTime'])+'%', sel['onTime']<85)}</div>
-            <div>{metric_block("Bid response", str(sel['responseRate'])+'%')}</div>
-            <div>{metric_block("Bid vs. budget", sel['bidVariance'], var_warn)}</div>
-            <div>{metric_block("Largest verified scope", sel['maxScope'])}</div>
-          </div>
-          <hr style="border-color:{C['line']}">
-          <div>{tier_stamp(sel['tier'])}
-            <div class="f-mono" style="font-size:11px;color:{C['inkSoft']};margin-top:8px">
-                 {sel['endorsements']} GC endorsements · {m['max']}</div></div>
-          <hr style="border-color:{C['line']}">
-          <div class="eyebrow">Network notes</div>
-          <div style="color:{C['ink']}">{sel['note']}</div>
-        </div>""", unsafe_allow_html=True)
-        b1, b2 = st.columns(2)
-        b1.button("Invite to Bid", key="invite_sel")
-        b2.button("Endorse", key="endorse_sel")
-
-
-# ─────────────────────────────────────────────────────────────────────────
-#  PAGE: NEW BID REQUEST  (3-step wizard using session_state)
-# ─────────────────────────────────────────────────────────────────────────
-def page_new_itb():
-    st.markdown('<div class="f-disp" style="font-size:30px;font-weight:700;color:#16263C">'
-                'NEW BID REQUEST</div>', unsafe_allow_html=True)
-
-    if "itb_step" not in st.session_state:
-        st.session_state.itb_step = 1
-    if "itb_picked" not in st.session_state:
-        st.session_state.itb_picked = {1}  # start with Morgado selected
-
-    step = st.session_state.itb_step
-    if step <= 3:
-        st.markdown(f'<div class="eyebrow">STEP {step} OF 3</div>', unsafe_allow_html=True)
-        st.progress(step / 3)
-
-    # STEP 1 — scope & drawings
-    if step == 1:
-        st.text_input("Project", "Lariat Ln Residence — 3,750 SF New Build")
-        st.selectbox("Trade package",
-                     ["Framing Package", "Concrete / Grading", "Electrical",
-                      "Plumbing Rough-In", "HVAC"])
-        st.text_area("Scope of work",
-                     "Complete structural framing per S-series drawings. 2-story, 3,750 SF. "
-                     "Includes shear walls, engineered hardware, roof trusses set. GC provides crane day.")
-        st.markdown('<div class="f-mono" style="font-size:11px;color:#3D4E63">'
-                    '📎 A2.1–A4.3 Plans.pdf · S1.0–S3.2 Structural.pdf · Scope_Framing_R2.docx</div>',
-                    unsafe_allow_html=True)
-        if st.button("Select Subs →"):
-            st.session_state.itb_step = 2
-            st.rerun()
-
-    # STEP 2 — select subs (tier gating enforced here)
-    elif step == 2:
-        st.markdown('<div class="f-mono" style="font-size:11px;color:#3D4E63">'
-                    'SCOPE VALUE EST. $410K — TIER 2+ REQUIRED. '
-                    'Sorted by fit: capacity, on-time record, verified scope size.</div>',
-                    unsafe_allow_html=True)
-
-        eligible = [s for s in SUBS if s["tier"] >= 2]
-        locked = [s for s in SUBS if s["tier"] < 2]
-
-        for s in eligible:
-            checked = s["id"] in st.session_state.itb_picked
-            new_val = st.checkbox(
-                f"{s['name']}  —  {s['onTime']}% on-time · {s['capacity'].lower()} capacity · max {s['maxScope']}",
-                value=checked, key=f"pick_{s['id']}")
-            if new_val:
-                st.session_state.itb_picked.add(s["id"])
-            else:
-                st.session_state.itb_picked.discard(s["id"])
-
-        # Locked tier-1 subs — shows exactly what they need to unlock
-        locked_html = ('<div class="card" style="background:#EDEFEA">'
-                       '<div class="f-mono" style="font-size:11px;color:#3D4E63">'
-                       '🔒 TIER 1 SUBS — LOCKED FOR SCOPES OVER $250K</div>')
-        for s in locked:
-            need = 3 - s["endorsements"]
-            note = (f"{need} endorsement{'s' if need > 1 else ''} from Tier 2"
-                    if need > 0 else "Pending review")
-            locked_html += (f'<div style="color:#3D4E63;font-size:14px;margin-top:4px">'
-                            f'{s["name"]} — {s["trade"]} '
-                            f'<span class="f-mono" style="font-size:11px">· {note}</span></div>')
-        locked_html += '</div>'
-        st.markdown(locked_html, unsafe_allow_html=True)
-
-        c1, c2 = st.columns([1, 1])
-        if c1.button("← Back"):
-            st.session_state.itb_step = 1
-            st.rerun()
-        if c2.button("Review →"):
-            st.session_state.itb_step = 3
-            st.rerun()
-
-    # STEP 3 — review & send
-    elif step == 3:
-        picked = [s for s in SUBS if s["id"] in st.session_state.itb_picked]
-        st.markdown(f"""
-        <div class="card" style="border-color:{C['ink']}">
-          <div class="f-disp" style="font-size:22px;font-weight:700;color:{C['ink']}">
-               REVIEW BID REQUEST</div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:8px">
-            <div>{metric_block("Trade package", "Framing Package")}</div>
-            <div>{metric_block("Response due", "Jul 21, 2026")}</div>
-            <div>{metric_block("Recipients", str(len(picked))+" subs")}</div>
-            <div>{metric_block("Attachments", "3 files")}</div>
-          </div>
-          <div class="f-mono" style="font-size:11px;color:{C['inkSoft']};margin-top:10px">
-               {' · '.join(s['name'] for s in picked) if picked else 'No subs selected'}</div>
-        </div>""", unsafe_allow_html=True)
-
-        c1, c2 = st.columns([1, 1])
-        if c1.button("← Back", key="rev_back"):
-            st.session_state.itb_step = 2
-            st.rerun()
-        if c2.button("Send Bid Request", key="send"):
-            st.session_state.itb_step = 99
-            st.rerun()
-
-    # SENT confirmation
-    elif step == 99:
-        n = len(st.session_state.itb_picked)
-        st.markdown(f"""
-        <div style="text-align:center;padding:30px">
-          <span class="stamp" style="border-color:{C['green']};color:{C['green']};
-                font-size:26px;padding:6px 20px">SENT</span>
-          <div style="color:{C['ink']};margin-top:20px;max-width:460px;margin-left:auto;margin-right:auto">
-            Bid request ITB-0143 issued to {n} subcontractor{'s' if n != 1 else ''}.
-            Drawings and scope attached. You'll be notified as responses come in,
-            and coverage-risk alerts fire at 50% of the response window.
-          </div>
-        </div>""", unsafe_allow_html=True)
-        if st.button("Start Another"):
-            st.session_state.itb_step = 1
-            st.session_state.itb_picked = {1}
-            st.rerun()
-
-
-# ─────────────────────────────────────────────────────────────────────────
-#  PAGE: TIER SYSTEM
-# ─────────────────────────────────────────────────────────────────────────
-def page_tiers():
-    st.markdown('<div class="f-disp" style="font-size:30px;font-weight:700;color:#16263C">'
-                'ENDORSEMENT TIERS</div>', unsafe_allow_html=True)
-    st.markdown(f'<div style="color:{C["inkSoft"]};margin-bottom:12px">'
-                'Subs climb tiers through endorsements from GCs they\'ve completed work for — '
-                'reputation earned on real jobs, not bought. Higher tiers unlock larger, '
-                'more complex scopes.</div>', unsafe_allow_html=True)
-
-    for t in [3, 2, 1]:
-        m = TIER_META[t]
-        st.markdown(f"""
-        <div class="card">
-          <div style="display:flex;align-items:center;gap:20px">
-            {tier_stamp(t)}
-            <div>
-              <div style="font-weight:600;color:{C['ink']}">{m['sub']}</div>
-              <div class="f-mono" style="font-size:11px;color:{C['inkSoft']}">{m['max']}</div>
-            </div>
-          </div>
-        </div>""", unsafe_allow_html=True)
-
-    st.markdown(f"""
-    <div class="card" style="background:{C['paper']};color:{C['inkSoft']}">
-      Endorsements are weighted by the endorsing GC's own track record and project size,
-      and decay if inactive for 24 months — keeping tiers a live signal, not a trophy case.
-    </div>""", unsafe_allow_html=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────
-#  ROUTER
-# ─────────────────────────────────────────────────────────────────────────
-if page == "Dashboard":
-    page_dashboard()
-elif page == "Sub Network":
-    page_subs()
-elif page == "New Bid Request":
-    page_new_itb()
-elif page == "Tier System":
-    page_tiers()
+if profile["role"] == "gc":
+    if page == "Dashboard":
+        screen_gc_dashboard(profile)
+    elif page == "New Bid Request":
+        screen_new_itb(profile)
+    else:
+        screen_network()
+else:
+    screen_sub_inbox(profile)
