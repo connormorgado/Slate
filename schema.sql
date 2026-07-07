@@ -76,12 +76,27 @@ create policy "insert own profile"
 create policy "update own profile"
   on profiles for update to authenticated using (id = auth.uid());
 
+-- Helper: checks invite membership WITHOUT triggering itb_invites' own
+-- RLS policy (security definer). Required because the itbs and
+-- itb_invites policies would otherwise reference each other and
+-- Postgres aborts with "infinite recursion detected in policy".
+create or replace function public.is_invited_to_itb(_itb_id bigint)
+returns boolean
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select exists (
+    select 1 from itb_invites
+    where itb_id = _itb_id and sub_id = auth.uid()
+  );
+$$;
+
 -- ITBs: GC sees their own; a sub sees ITBs they were invited to.
 create policy "gc reads own itbs"
   on itbs for select to authenticated
-  using (gc_id = auth.uid()
-         or exists (select 1 from itb_invites v
-                    where v.itb_id = itbs.id and v.sub_id = auth.uid()));
+  using (gc_id = auth.uid() or public.is_invited_to_itb(id));
 create policy "gc creates itbs"
   on itbs for insert to authenticated with check (gc_id = auth.uid());
 
