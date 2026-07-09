@@ -13,7 +13,13 @@ create table if not exists profiles (
   company     text not null,
   trade       text,            -- subs only, e.g. 'Electrical (C-10)'
   region      text,
-  license_no  text,            -- CSLB license number (subs)
+  license_no  text,            -- CSLB license number
+  verification_status text not null default 'unverified'
+      check (verification_status in ('unverified','pending','verified','rejected')),
+  verified_at   timestamptz,
+  cslb_status   text,           -- raw status line from CSLB lookup
+  cslb_expires  text,           -- license expiration
+  cslb_business text,           -- business name on the license
   created_at  timestamptz default now()
 );
 
@@ -41,7 +47,7 @@ create table if not exists itb_invites (
   id          bigint generated always as identity primary key,
   itb_id      bigint not null references itbs(id) on delete cascade,
   sub_id      uuid not null references profiles(id),
-  status      text not null default 'sent' check (status in ('sent','responded','declined')),
+  status      text not null default 'sent' check (status in ('sent','responded','declined','awarded','not_selected')),
   created_at  timestamptz default now(),
   unique (itb_id, sub_id)
 );
@@ -53,8 +59,16 @@ create table if not exists bids (
   sub_id      uuid not null references profiles(id),
   amount      numeric not null,
   note        text,
-  created_at  timestamptz default now(),
-  unique (itb_id, sub_id)
+  revision    int not null default 1,   -- bid revisions: highest = current
+  created_at  timestamptz default now()
+);
+
+-- ── BID FILES (sub's proposal docs, COI, inclusions — GC can view) ──
+create table if not exists bid_files (
+  id          bigint generated always as identity primary key,
+  bid_id      bigint not null references bids(id) on delete cascade,
+  path        text not null,
+  filename    text not null
 );
 
 -- ═══ ROW LEVEL SECURITY ══════════════════════════════════════════════
@@ -66,6 +80,7 @@ alter table itbs        enable row level security;
 alter table itb_files   enable row level security;
 alter table itb_invites enable row level security;
 alter table bids        enable row level security;
+alter table bid_files   enable row level security;
 
 -- Profiles: any signed-in user can read (GCs browse subs); you can
 -- only create/update your own row.
@@ -124,6 +139,10 @@ create policy "gc invites subs to own itbs"
                       where i.id = itb_invites.itb_id and i.gc_id = auth.uid()));
 create policy "sub updates own invite status"
   on itb_invites for update to authenticated using (sub_id = auth.uid());
+create policy "gc updates invites on own itbs"
+  on itb_invites for update to authenticated
+  using (exists (select 1 from itbs i
+                 where i.id = itb_invites.itb_id and i.gc_id = auth.uid()));
 
 -- Bids: an invited sub submits one; sub sees their own, GC sees all
 -- bids on their ITBs.
@@ -137,6 +156,21 @@ create policy "invited sub submits bid"
   with check (sub_id = auth.uid()
               and exists (select 1 from itb_invites v
                           where v.itb_id = bids.itb_id and v.sub_id = auth.uid()));
+
+-- Bid files: readable by the bidding sub and the ITB's GC; only the
+-- bidding sub attaches.
+create policy "read bid files if you can read the bid"
+  on bid_files for select to authenticated
+  using (exists (select 1 from bids b
+                 where b.id = bid_files.bid_id
+                 and (b.sub_id = auth.uid()
+                      or exists (select 1 from itbs i
+                                 where i.id = b.itb_id and i.gc_id = auth.uid()))));
+create policy "sub attaches files to own bids"
+  on bid_files for insert to authenticated
+  with check (exists (select 1 from bids b
+                      where b.id = bid_files.bid_id
+                      and b.sub_id = auth.uid()));
 
 -- ═══ STORAGE ═════════════════════════════════════════════════════════
 -- Private bucket for drawings/scope docs. The app generates short-lived

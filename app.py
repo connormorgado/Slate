@@ -29,22 +29,57 @@ HOW IT WORKS:
 The demo with mock data still lives in demo_app.py.
 """
 
+import base64
 import mimetypes
+import os
+import re
 import time
+from datetime import datetime, timezone
 
 import requests
 import streamlit as st
 from supabase import create_client
 
+from cslb import check_license
+
 # ─────────────────────────────────────────────────────────────────────
 #  CONFIG + THEME
 # ─────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="SLATE", page_icon="🪧", layout="wide")
+LOGO_PATH = "assets/slate_logo.png"
+ICON_PATH = "assets/slate_icon.png"
+
+st.set_page_config(
+    page_title="SLATE",
+    page_icon=ICON_PATH if os.path.exists(ICON_PATH) else "🪧",
+    layout="wide",
+)
+
+
+@st.cache_data
+def _logo_b64():
+    if not os.path.exists(LOGO_PATH):
+        return None
+    return base64.b64encode(open(LOGO_PATH, "rb").read()).decode()
+
+
+def logo_html(width=170, boxed=False):
+    """The SLATE logo as inline HTML. Falls back to the text wordmark if
+    the image file isn't in the repo. boxed=True wraps it in a dark card
+    so the green glow reads on light backgrounds (e.g. the login page)."""
+    b64 = _logo_b64()
+    if b64 is None:
+        return ('<div class="wordmark" style="color:#141B17">SLATE'
+                '<span style="color:#1D7A44">.</span></div>')
+    img = f'<img src="data:image/png;base64,{b64}" width="{width}" alt="SLATE">'
+    if boxed:
+        return (f'<div style="background:#101613;display:inline-block;'
+                f'padding:22px 30px;border-radius:8px">{img}</div>')
+    return img
 
 C = {
-    "paper": "#EDEFEA", "ink": "#16263C", "inkSoft": "#3D4E63",
-    "line": "#C6CCC4", "orange": "#E8621A", "blue": "#2E5E8C",
-    "green": "#3E7A4E", "white": "#FAFBF8",
+    "paper": "#EDEFEA", "ink": "#141B17", "inkSoft": "#44544A",
+    "line": "#C6CCC4", "accent": "#1D7A44", "neon": "#6EE86E",
+    "blue": "#2E5E8C", "green": "#3E7A4E", "white": "#FAFBF8",
 }
 
 st.markdown("""
@@ -54,17 +89,17 @@ st.markdown("""
 .f-disp { font-family: 'Barlow Condensed', sans-serif; }
 .f-mono { font-family: 'IBM Plex Mono', monospace; }
 html, body, [class*="css"] { font-family: 'Barlow', sans-serif; }
-section[data-testid="stSidebar"] { background: #16263C; }
-section[data-testid="stSidebar"] * { color: #C6D0DC; }
+section[data-testid="stSidebar"] { background: #0D0F0E; }
+section[data-testid="stSidebar"] * { color: #BFCCC2; }
 .card { background:#FAFBF8; border:1px solid #C6CCC4; border-radius:3px;
         padding:16px; margin-bottom:12px; }
 .wordmark { font-family:'Barlow Condensed',sans-serif; font-weight:700;
             font-size:30px; color:#FFF; letter-spacing:0.5px; line-height:1; }
 .eyebrow { font-family:'IBM Plex Mono',monospace; font-size:10px;
            text-transform:uppercase; letter-spacing:1px; color:#3D4E63; }
-.stButton > button { background:#E8621A; color:#FFF; border:none; border-radius:3px;
+.stButton > button { background:#1D7A44; color:#FFF; border:none; border-radius:3px;
   font-family:'Barlow Condensed',sans-serif; font-weight:600; letter-spacing:1px; }
-.stButton > button:hover { background:#cf560f; color:#FFF; }
+.stButton > button:hover { background:#14572F; color:#FFF; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -167,10 +202,9 @@ def send_itb_email(to_email, gc_company, project, trade, due, app_url):
 #  SCREEN: LOGIN / SIGN UP
 # ─────────────────────────────────────────────────────────────────────
 def screen_auth():
-    st.markdown('<div class="wordmark" style="color:#16263C">SLATE'
-                '<span style="color:#E8621A">.</span></div>', unsafe_allow_html=True)
-    st.markdown('<div class="eyebrow">BY CONTRACTORS, FOR CONTRACTORS</div>',
-                unsafe_allow_html=True)
+    st.markdown(logo_html(width=190, boxed=True), unsafe_allow_html=True)
+    st.markdown('<div class="eyebrow" style="margin-top:8px">BY CONTRACTORS, '
+                'FOR CONTRACTORS</div>', unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
 
     tab_in, tab_up = st.tabs(["Log in", "Create account"])
@@ -226,16 +260,198 @@ def screen_onboarding():
 
 
 # ─────────────────────────────────────────────────────────────────────
+#  SHARED HELPERS
+# ─────────────────────────────────────────────────────────────────────
+def latest_bids_by_sub(bids):
+    """From all bid rows on an ITB, keep only each sub's latest revision."""
+    latest = {}
+    for b in bids:
+        cur = latest.get(b["sub_id"])
+        if cur is None or b["revision"] > cur["revision"]:
+            latest[b["sub_id"]] = b
+    return latest
+
+
+def signed_link(path):
+    """Short-lived download URL for a file in the private bucket."""
+    try:
+        signed = sb().storage.from_("drawings").create_signed_url(path, 3600)
+        return signed.get("signedURL") or signed.get("signed_url")
+    except Exception:
+        return None
+
+
+def upload_bid_files(itb_id, bid_id, files):
+    """Store a sub's bid documents and record them against the bid."""
+    for f in files or []:
+        path = f"bids/{itb_id}/{bid_id}/{int(time.time())}_{f.name}"
+        mime = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
+        sb().storage.from_("drawings").upload(path, f.getvalue(),
+                                              {"content-type": mime})
+        sb().table("bid_files").insert({
+            "bid_id": bid_id, "path": path, "filename": f.name,
+        }).execute()
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  VERIFICATION HELPERS
+# ─────────────────────────────────────────────────────────────────────
+_NAME_NOISE = {"inc", "incorporated", "llc", "corp", "corporation", "co",
+               "company", "ltd", "the", "and", "&", "of", "a", "dba",
+               "general", "contractor", "contractors", "contracting"}
+
+
+def _name_tokens(name):
+    name = re.sub(r"[^a-z0-9 ]", " ", (name or "").lower())
+    return {t for t in name.split() if t and t not in _NAME_NOISE}
+
+
+def name_match(profile_company, cslb_business):
+    """True when the profile company plausibly matches the CSLB record.
+    Deliberately conservative — anything fuzzy goes to manual review."""
+    a, b = _name_tokens(profile_company), _name_tokens(cslb_business)
+    if not a or not b:
+        return False
+    overlap = a & b
+    return len(overlap) / min(len(a), len(b)) >= 0.6
+
+
+def is_verified(profile):
+    return profile.get("verification_status") == "verified"
+
+
+def verified_badge(profile_or_status):
+    status = (profile_or_status.get("verification_status")
+              if isinstance(profile_or_status, dict) else profile_or_status)
+    if status == "verified":
+        return (' <span class="f-mono" style="color:#3E7A4E;font-size:11px">'
+                '✓ VERIFIED</span>')
+    return ""
+
+
+def verification_banner(profile):
+    """Nudge shown on home screens until the account is verified."""
+    vs = profile.get("verification_status", "unverified")
+    if vs == "verified":
+        return
+    if vs == "pending":
+        st.info("⏳ **Verification pending review.** You'll be unlocked once "
+                "your license check is approved — usually same day.")
+    else:
+        action = ("appear on bid lists" if profile["role"] == "sub"
+                  else "send bid requests")
+        st.warning(f"⚠️ **Get verified to {action}.** Open **Get Verified** in "
+                   f"the sidebar — takes about a minute with your CSLB license "
+                   f"number.")
+
+
+def apply_verification(result, license_no, profile):
+    """Hybrid decision: clean active-license + name match -> verified;
+    anything else that looked like a real license -> pending review."""
+    update = {
+        "license_no": license_no,
+        "cslb_status": result.get("status"),
+        "cslb_expires": result.get("expires"),
+        "cslb_business": result.get("business"),
+    }
+    if (result.get("active") and result.get("business")
+            and name_match(profile["company"], result["business"])):
+        update["verification_status"] = "verified"
+        update["verified_at"] = datetime.now(timezone.utc).isoformat()
+    else:
+        update["verification_status"] = "pending"
+    sb().table("profiles").update(update).eq(
+        "id", st.session_state.user_id).execute()
+    st.session_state.profile = {**profile, **update}
+    return update["verification_status"]
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  SCREEN: GET VERIFIED
+# ─────────────────────────────────────────────────────────────────────
+def screen_verify(profile):
+    heading("GET VERIFIED")
+    vs = profile.get("verification_status", "unverified")
+
+    if vs == "verified":
+        st.success(f"✓ Verified"
+                   + (f" — license {profile.get('license_no')}" if profile.get("license_no") else ""))
+        st.markdown(
+            f'<div class="card">'
+            f'<div class="eyebrow">CSLB RECORD</div>'
+            f'<div style="color:{C["ink"]}">'
+            f'{profile.get("cslb_business") or profile.get("company")}<br>'
+            f'Status: {profile.get("cslb_status") or "—"}<br>'
+            f'Expires: {profile.get("cslb_expires") or "—"}</div></div>',
+            unsafe_allow_html=True)
+        return
+
+    if vs == "pending":
+        st.info("⏳ Your verification is pending manual review. You'll be "
+                "unlocked once it's approved. If your license or company "
+                "details were wrong, you can rerun the check below.")
+
+    st.markdown(
+        f'<div style="color:{C["inkSoft"]};margin-bottom:8px">'
+        f'SLATE verifies every contractor against the California CSLB before '
+        f'they can {"appear on bid lists" if profile["role"] == "sub" else "send bid requests"}. '
+        f'Enter your license number — we check that it\'s current and active '
+        f'and that it matches your company name '
+        f'(<b>{profile["company"]}</b>).</div>', unsafe_allow_html=True)
+
+    lic = st.text_input("CSLB license #", value=profile.get("license_no") or "")
+    if st.button("Run verification"):
+        if not lic.strip():
+            st.error("Enter your CSLB license number.")
+            return
+        with st.spinner("Checking CSLB…"):
+            result = check_license(lic.strip())
+        if not result.get("ok"):
+            st.warning(f"The automated lookup didn't go through "
+                       f"({result.get('error', 'lookup failed')}). "
+                       f"You can [check your license manually]({result['url']}) "
+                       f"and submit for review below.")
+            if st.button("Submit for manual review"):
+                sb().table("profiles").update({
+                    "license_no": lic.strip(),
+                    "verification_status": "pending",
+                }).eq("id", st.session_state.user_id).execute()
+                st.session_state.profile = {**profile, "license_no": lic.strip(),
+                                            "verification_status": "pending"}
+                st.rerun()
+            return
+        outcome = apply_verification(result, lic.strip(), profile)
+        if outcome == "verified":
+            st.success("✓ Verified! Your license is current and active and "
+                       "matches your company. You're unlocked.")
+            time.sleep(1.5)
+            st.rerun()
+        else:
+            st.info(f"License found — status: **{result.get('status')}**"
+                    + (f", business name on record: **{result.get('business')}**"
+                       if result.get("business") else "")
+                    + ". It didn't auto-match cleanly, so it's been queued for "
+                    "manual review. You'll be unlocked once approved.")
+
+
+# ─────────────────────────────────────────────────────────────────────
 #  GC SCREEN: NEW BID REQUEST  (create ITB -> upload files -> invite -> email)
 # ─────────────────────────────────────────────────────────────────────
 def screen_new_itb(profile):
     heading("NEW BID REQUEST")
 
-    subs = (sb().table("profiles").select("id, company, trade, region, email")
-            .eq("role", "sub").execute().data)
+    if not is_verified(profile):
+        verification_banner(profile)
+        return
+
+    subs = (sb().table("profiles")
+            .select("id, company, trade, region, email")
+            .eq("role", "sub")
+            .eq("verification_status", "verified").execute().data)
     if not subs:
-        st.info("No subcontractors have joined yet. Invite your subs to create "
-                "accounts — this screen goes live the moment the first one signs up.")
+        st.info("No verified subcontractors yet. Subs appear here once they "
+                "complete CSLB verification — invite yours to sign up and "
+                "hit **Get Verified**.")
         return
 
     project = st.text_input("Project", placeholder="Lariat Ln Residence — 3,750 SF New Build")
@@ -301,6 +517,7 @@ def screen_new_itb(profile):
 # ─────────────────────────────────────────────────────────────────────
 def screen_gc_dashboard(profile):
     heading("DASHBOARD")
+    verification_banner(profile)
     itbs = (sb().table("itbs").select("*")
             .eq("gc_id", st.session_state.user_id)
             .order("created_at", desc=True).execute().data)
@@ -309,37 +526,82 @@ def screen_gc_dashboard(profile):
         return
 
     for itb in itbs:
-        invites = (sb().table("itb_invites").select("sub_id, status")
+        invites = (sb().table("itb_invites").select("id, sub_id, status")
                    .eq("itb_id", itb["id"]).execute().data)
-        bids = (sb().table("bids").select("sub_id, amount, note, created_at")
-                .eq("itb_id", itb["id"]).order("amount").execute().data)
-        responded = sum(1 for v in invites if v["status"] == "responded")
+        bids = (sb().table("bids").select("*")
+                .eq("itb_id", itb["id"]).execute().data)
+        latest = latest_bids_by_sub(bids)
+        responded = sum(1 for v in invites if v["status"] in ("responded", "awarded"))
+        awarded = next((v for v in invites if v["status"] == "awarded"), None)
+        title_flag = " · 🏆 AWARDED" if awarded else ""
+
         with st.expander(f"ITB-{itb['id']:04d} · {itb['project']} — {itb['trade']} "
-                         f"({responded}/{len(invites)} responded, due {itb['due_date']})"):
+                         f"({responded}/{len(invites)} responded, "
+                         f"due {itb['due_date']}){title_flag}"):
             if itb.get("scope"):
                 st.markdown(f'<div class="eyebrow">SCOPE</div>'
                             f'<div style="color:{C["ink"]}">{itb["scope"]}</div>',
                             unsafe_allow_html=True)
-            if not bids:
+            if not latest:
                 st.markdown(f'<div style="color:{C["inkSoft"]}">No bids yet.</div>',
                             unsafe_allow_html=True)
                 continue
-            # look up company names for the bids
-            ids = [b["sub_id"] for b in bids]
+
+            # names + any bid documents, fetched once per ITB
             names = {p["id"]: p["company"] for p in
                      sb().table("profiles").select("id, company")
-                     .in_("id", ids).execute().data}
-            low = min(b["amount"] for b in bids)
-            for b in bids:
-                tag = (' <span class="f-mono" style="color:#3E7A4E;font-size:11px">'
-                       'LOW BID</span>' if b["amount"] == low and len(bids) > 1 else "")
+                     .in_("id", list(latest.keys())).execute().data}
+            bid_ids = [b["id"] for b in latest.values()]
+            files_by_bid = {}
+            for f in (sb().table("bid_files").select("bid_id, path, filename")
+                      .in_("bid_id", bid_ids).execute().data):
+                files_by_bid.setdefault(f["bid_id"], []).append(f)
+
+            ranked = sorted(latest.values(), key=lambda b: b["amount"])
+            low = ranked[0]["amount"]
+            for b in ranked:
+                sub_name = names.get(b["sub_id"], "Sub")
+                invite = next((v for v in invites if v["sub_id"] == b["sub_id"]), None)
+                tags = ""
+                if b["amount"] == low and len(ranked) > 1:
+                    tags += (' <span class="f-mono" style="color:#3E7A4E;'
+                             'font-size:11px">LOW BID</span>')
+                if b["revision"] > 1:
+                    tags += (f' <span class="f-mono" style="color:#2E5E8C;'
+                             f'font-size:11px">REV {b["revision"]}</span>')
+                if invite and invite["status"] == "awarded":
+                    tags += (' <span class="f-mono" style="color:#1D7A44;'
+                             'font-size:11px">🏆 AWARDED</span>')
+                elif invite and invite["status"] == "not_selected":
+                    tags += (' <span class="f-mono" style="color:#3D4E63;'
+                             'font-size:11px">NOT SELECTED</span>')
+
                 st.markdown(
-                    f'<div class="card"><b>{names.get(b["sub_id"], "Sub")}</b> — '
+                    f'<div class="card"><b>{sub_name}</b> — '
                     f'<span class="f-disp" style="font-size:20px;font-weight:600">'
-                    f'${b["amount"]:,.0f}</span>{tag}'
+                    f'${b["amount"]:,.0f}</span>{tags}'
                     f'<div style="color:{C["inkSoft"]};font-size:14px">'
                     f'{b.get("note") or ""}</div></div>',
                     unsafe_allow_html=True)
+
+                for f in files_by_bid.get(b["id"], []):
+                    url = signed_link(f["path"])
+                    st.markdown(f"- 📎 [{f['filename']}]({url})" if url
+                                else f"- 📎 {f['filename']} (link unavailable)")
+
+                if not awarded and invite:
+                    if st.button(f"Award to {sub_name}",
+                                 key=f"award_{itb['id']}_{b['sub_id']}"):
+                        for v in invites:
+                            if v["sub_id"] == b["sub_id"]:
+                                new_status = "awarded"
+                            elif v["status"] in ("sent", "responded"):
+                                new_status = "not_selected"
+                            else:
+                                new_status = v["status"]
+                            sb().table("itb_invites").update(
+                                {"status": new_status}).eq("id", v["id"]).execute()
+                        st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -347,6 +609,7 @@ def screen_gc_dashboard(profile):
 # ─────────────────────────────────────────────────────────────────────
 def screen_sub_inbox(profile):
     heading("BID INVITES")
+    verification_banner(profile)
     invites = (sb().table("itb_invites").select("*")
                .eq("sub_id", st.session_state.user_id)
                .order("created_at", desc=True).execute().data)
@@ -354,6 +617,10 @@ def screen_sub_inbox(profile):
         st.info("No bid invites yet. When a GC sends you one, it lands here "
                 "and in your email.")
         return
+
+    BADGES = {"sent": "🟠 AWAITING YOUR BID", "responded": "✅ RESPONDED",
+              "awarded": "🏆 AWARDED TO YOU", "not_selected": "◻️ NOT SELECTED",
+              "declined": "❌ DECLINED"}
 
     for v in invites:
         itb = (sb().table("itbs").select("*").eq("id", v["itb_id"]).execute().data)
@@ -363,10 +630,18 @@ def screen_sub_inbox(profile):
         gc = (sb().table("profiles").select("company")
               .eq("id", itb["gc_id"]).execute().data)
         gc_name = gc[0]["company"] if gc else "GC"
-        badge = "✅ RESPONDED" if v["status"] == "responded" else "🟠 AWAITING YOUR BID"
+        badge = BADGES.get(v["status"], v["status"])
 
         with st.expander(f"{badge} · {itb['project']} — {itb['trade']} "
                          f"(from {gc_name}, due {itb['due_date']})"):
+            if v["status"] == "awarded":
+                st.success("You were awarded this scope. The GC will follow up "
+                           "on contract next steps.")
+            elif v["status"] == "not_selected":
+                st.markdown(f'<div style="color:{C["inkSoft"]}">This scope went '
+                            f'to another sub. Thanks for bidding — your response '
+                            f'record still counts.</div>', unsafe_allow_html=True)
+
             if itb.get("scope"):
                 st.markdown(f'<div class="eyebrow">SCOPE</div>'
                             f'<div style="color:{C["ink"]}">{itb["scope"]}</div>',
@@ -379,32 +654,62 @@ def screen_sub_inbox(profile):
                 st.markdown('<div class="eyebrow" style="margin-top:8px">DRAWINGS'
                             '</div>', unsafe_allow_html=True)
                 for f in fs:
-                    try:
-                        signed = sb().storage.from_("drawings").create_signed_url(
-                            f["path"], 3600)
-                        url = signed.get("signedURL") or signed.get("signed_url")
-                        st.markdown(f"- [{f['filename']}]({url})")
-                    except Exception:
-                        st.markdown(f"- {f['filename']} (link unavailable)")
+                    url = signed_link(f["path"])
+                    st.markdown(f"- [{f['filename']}]({url})" if url
+                                else f"- {f['filename']} (link unavailable)")
 
-            if v["status"] != "responded":
-                amount = st.number_input("Your bid ($)", min_value=0.0, step=1000.0,
-                                         key=f"amt_{v['id']}")
+            # my current bid (latest revision), if any
+            mine = (sb().table("bids").select("*")
+                    .eq("itb_id", itb["id"])
+                    .eq("sub_id", st.session_state.user_id).execute().data)
+            current = max(mine, key=lambda b: b["revision"]) if mine else None
+            if current:
+                rev_tag = (f' <span class="f-mono" style="color:#2E5E8C;'
+                           f'font-size:11px">REV {current["revision"]}</span>'
+                           if current["revision"] > 1 else "")
+                st.markdown(
+                    f'<div class="card"><div class="eyebrow">YOUR CURRENT BID</div>'
+                    f'<span class="f-disp" style="font-size:20px;font-weight:600">'
+                    f'${current["amount"]:,.0f}</span>{rev_tag}'
+                    f'<div style="color:{C["inkSoft"]};font-size:14px">'
+                    f'{current.get("note") or ""}</div></div>',
+                    unsafe_allow_html=True)
+                cur_files = (sb().table("bid_files").select("path, filename")
+                             .eq("bid_id", current["id"]).execute().data)
+                for f in cur_files:
+                    url = signed_link(f["path"])
+                    st.markdown(f"- 📎 [{f['filename']}]({url})" if url
+                                else f"- 📎 {f['filename']} (link unavailable)")
+
+            # bid / revise — open until the GC makes an award decision
+            if v["status"] in ("sent", "responded"):
+                st.markdown(f'<div class="eyebrow" style="margin-top:8px">'
+                            f'{"REVISE YOUR BID" if current else "SUBMIT YOUR BID"}'
+                            f'</div>', unsafe_allow_html=True)
+                amount = st.number_input("Bid amount ($)", min_value=0.0,
+                                         step=1000.0, key=f"amt_{v['id']}")
                 note = st.text_area("Notes (inclusions, exclusions, lead time)",
                                     key=f"note_{v['id']}")
-                if st.button("Submit bid", key=f"send_{v['id']}"):
+                docs = st.file_uploader(
+                    "Attach bid documents (proposal PDF, inclusions list, COI)",
+                    accept_multiple_files=True, key=f"docs_{v['id']}")
+                label = "Submit revised bid" if current else "Submit bid"
+                if st.button(label, key=f"send_{v['id']}"):
                     if amount <= 0:
                         st.error("Enter a bid amount.")
                     else:
-                        sb().table("bids").insert({
+                        new_rev = (current["revision"] + 1) if current else 1
+                        bid = (sb().table("bids").insert({
                             "itb_id": itb["id"],
                             "sub_id": st.session_state.user_id,
                             "amount": amount,
                             "note": note.strip() or None,
-                        }).execute()
+                            "revision": new_rev,
+                        }).execute().data)[0]
+                        upload_bid_files(itb["id"], bid["id"], docs)
                         sb().table("itb_invites").update(
                             {"status": "responded"}).eq("id", v["id"]).execute()
-                        st.success("Bid submitted.")
+                        st.success(f"Bid submitted (revision {new_rev}).")
                         st.rerun()
 
 
@@ -413,18 +718,38 @@ def screen_sub_inbox(profile):
 # ─────────────────────────────────────────────────────────────────────
 def screen_network():
     heading("SUB NETWORK")
-    subs = (sb().table("profiles").select("company, trade, region, license_no")
+    subs = (sb().table("profiles")
+            .select("id, company, trade, region, license_no, verification_status")
             .eq("role", "sub").order("company").execute().data)
     if not subs:
         st.info("No subs registered yet.")
         return
     for s in subs:
+        badge = verified_badge(s)
+        extra = ("" if s.get("verification_status") == "verified" else
+                 f' <span class="f-mono" style="color:{C["inkSoft"]};'
+                 f'font-size:11px">NOT YET VERIFIED — can\'t be invited</span>')
         st.markdown(
-            f'<div class="card"><b>{s["company"]}</b>'
+            f'<div class="card"><b>{s["company"]}</b>{badge}{extra}'
             f'<div class="f-mono" style="font-size:11px;color:{C["inkSoft"]}">'
             f'{s.get("trade") or "trade not set"} · {s.get("region") or ""} · '
             f'CSLB {s.get("license_no") or "—"}</div></div>',
             unsafe_allow_html=True)
+        if s.get("license_no"):
+            if st.button(f"Verify CSLB #{s['license_no']}", key=f"cslb_{s['id']}"):
+                with st.spinner("Checking CSLB…"):
+                    res = check_license(s["license_no"])
+                if res.get("ok") and res.get("active"):
+                    exp = f" · expires {res['expires']}" if res.get("expires") else ""
+                    st.success(f"License is {res['status']}{exp}. "
+                               f"[View on CSLB]({res['url']})")
+                elif res.get("ok"):
+                    st.warning(f"License status: {res['status']}. "
+                               f"[View on CSLB]({res['url']})")
+                else:
+                    st.warning(f"Couldn't verify automatically "
+                               f"({res.get('error', 'lookup failed')}). "
+                               f"[Check manually on CSLB]({res['url']})")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -442,24 +767,29 @@ if profile is None:
     st.stop()
 
 with st.sidebar:
-    st.markdown('<div class="wordmark">SLATE<span style="color:#E8621A">.</span></div>',
-                unsafe_allow_html=True)
-    st.markdown(f'<div class="f-mono" style="font-size:10px;color:#8FA0B5;'
+    st.markdown(logo_html(width=150), unsafe_allow_html=True)
+    check = " ✓" if is_verified(profile) else ""
+    st.markdown(f'<div class="f-mono" style="font-size:10px;color:#7FA98C;'
                 f'margin-top:4px">{profile["company"].upper()} · '
-                f'{"GC" if profile["role"] == "gc" else "SUB"}</div>',
+                f'{"GC" if profile["role"] == "gc" else "SUB"}{check}</div>',
                 unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
     if profile["role"] == "gc":
-        page = st.radio("Navigate", ["Dashboard", "New Bid Request", "Sub Network"],
+        page = st.radio("Navigate",
+                        ["Dashboard", "New Bid Request", "Sub Network",
+                         "Get Verified"],
                         label_visibility="collapsed")
     else:
-        page = st.radio("Navigate", ["Bid Invites"], label_visibility="collapsed")
+        page = st.radio("Navigate", ["Bid Invites", "Get Verified"],
+                        label_visibility="collapsed")
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("Log out"):
         sign_out()
         st.rerun()
 
-if profile["role"] == "gc":
+if page == "Get Verified":
+    screen_verify(profile)
+elif profile["role"] == "gc":
     if page == "Dashboard":
         screen_gc_dashboard(profile)
     elif page == "New Bid Request":

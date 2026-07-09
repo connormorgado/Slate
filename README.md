@@ -74,3 +74,47 @@ streamlit run demo_app.py   # the mock demo
 - Streamlit logs you out on page refresh (session isn't persisted) — fine for
   a pilot, solved in the post-validation rebuild
 - One bid per sub per ITB, no bid revisions yet
+
+## Migration 002 — bid revisions, awards, bid documents, CSLB
+
+If your Supabase project was set up before these features: run
+`migration_002.sql` once in the SQL Editor. Fresh installs skip this —
+`schema.sql` already includes everything.
+
+New in this version:
+
+- **Bid revisions** — subs can resubmit; the GC sees the latest number
+  with a REV badge, and history stays in the database
+- **Award / not selected** — GC clicks "Award to [sub]" on the dashboard;
+  the winner sees 🏆 AWARDED TO YOU, everyone else sees NOT SELECTED.
+  No more ghosting — every bidder hears back
+- **Bid documents** — subs attach proposal PDFs, inclusions lists, COIs;
+  the GC downloads them right under each bid
+- **CSLB verification** — a "Verify CSLB #" button on Sub Network checks
+  the license against the state board's public lookup (best-effort HTML
+  parsing since CSLB has no official API; falls back to a manual-check
+  link if the site blocks or changes)
+
+## Migration 003 — contractor verification
+
+Run `migration_003.sql` once in the SQL Editor (existing projects only).
+
+How verification works:
+
+- Everyone can sign up, but **unverified GCs can't send bid requests** and
+  **unverified subs don't appear on bid lists**. Both see a Get Verified
+  prompt on their home screen.
+- **Get Verified** (sidebar) checks their CSLB license: current-and-active
+  license + company name matching the CSLB record = instant ✓ VERIFIED.
+- Anything fuzzy (name mismatch, inactive license, lookup blocked) goes to
+  **pending** for manual review.
+
+**Approving pending accounts (that's you):** Supabase → Table Editor →
+`profiles` → find the row → set `verification_status` to `verified`.
+Your existing test accounts start as `unverified` — verify them the same
+way, or run the flow with a real license number.
+
+Pilot-level caveat: verification runs client-side with the user's own
+database permissions, so a technically savvy user could theoretically
+self-verify via the API. Fine for a trusted pilot; move the decision into
+a Supabase Edge Function before opening signups to strangers.
