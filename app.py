@@ -45,8 +45,9 @@ from cslb import check_license
 # ─────────────────────────────────────────────────────────────────────
 #  CONFIG + THEME
 # ─────────────────────────────────────────────────────────────────────
-LOGO_PATH = "assets/slate_logo.png"
-ICON_PATH = "assets/slate_icon.png"
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGO_PATH = os.path.join(_APP_DIR, "assets", "slate_logo.png")
+ICON_PATH = os.path.join(_APP_DIR, "assets", "slate_icon.png")
 
 st.set_page_config(
     page_title="SLATE",
@@ -55,7 +56,6 @@ st.set_page_config(
 )
 
 
-@st.cache_data
 def _logo_b64():
     if not os.path.exists(LOGO_PATH):
         return None
@@ -63,13 +63,15 @@ def _logo_b64():
 
 
 def logo_html(width=170, boxed=False):
-    """The SLATE logo as inline HTML. Falls back to the text wordmark if
-    the image file isn't in the repo. boxed=True wraps it in a dark card
-    so the green glow reads on light backgrounds (e.g. the login page)."""
+    """The SLATE logo as inline HTML. Falls back to a text wordmark if
+    the image isn't found — white for the dark sidebar, dark ink when
+    boxed (light backgrounds). boxed=True wraps the image in a dark card
+    so the green glow reads on light pages (e.g. login)."""
     b64 = _logo_b64()
     if b64 is None:
-        return ('<div class="wordmark" style="color:#141B17">SLATE'
-                '<span style="color:#1D7A44">.</span></div>')
+        color = "#141B17" if boxed else "#FFFFFF"
+        return (f'<div class="wordmark" style="color:{color}">SLATE'
+                f'<span style="color:#6EE86E">.</span></div>')
     img = f'<img src="data:image/png;base64,{b64}" width="{width}" alt="SLATE">'
     if boxed:
         return (f'<div style="background:#101613;display:inline-block;'
