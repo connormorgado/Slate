@@ -30,6 +30,7 @@ The demo with mock data still lives in demo_app.py.
 """
 
 import base64
+import io
 import mimetypes
 import os
 import re
@@ -38,9 +39,33 @@ from datetime import date, datetime, timedelta, timezone
 
 import requests
 import streamlit as st
+from PIL import Image
 from supabase import create_client
 
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()   # lets PIL open iPhone HEIC files
+except Exception:
+    pass
+
 from cslb import check_license
+
+
+def photo_to_jpeg(uploaded, max_px=1600):
+    """Convert any uploaded photo (including iPhone HEIC) to a
+    web-friendly JPEG, resized for fast profile loads.
+    Returns (bytes, filename). Falls back to the raw file if
+    conversion fails."""
+    try:
+        img = Image.open(io.BytesIO(uploaded.getvalue()))
+        img = img.convert("RGB")
+        img.thumbnail((max_px, max_px), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=85, optimize=True)
+        base = uploaded.name.rsplit(".", 1)[0]
+        return buf.getvalue(), f"{base}.jpg"
+    except Exception:
+        return uploaded.getvalue(), uploaded.name
 
 # ─────────────────────────────────────────────────────────────────────
 #  CONFIG + THEME
@@ -1134,15 +1159,20 @@ def screen_my_profile(profile):
                     "description": pdesc.strip() or None,
                 }).execute().data)[0]
                 for ph in pphotos or []:
+                    data, fname = photo_to_jpeg(ph)
                     path = (f"portfolio/{st.session_state.user_id}/"
-                            f"{proj['id']}/{int(time.time())}_{ph.name}")
-                    mime = mimetypes.guess_type(ph.name)[0] or "image/jpeg"
+                            f"{proj['id']}/{int(time.time())}_{fname}")
+                    mime = mimetypes.guess_type(fname)[0] or "image/jpeg"
                     sb().storage.from_("drawings").upload(
-                        path, ph.getvalue(), {"content-type": mime})
+                        path, data, {"content-type": mime})
                     sb().table("project_photos").insert({
                         "project_id": proj["id"], "path": path,
                         "caption": None,
                     }).execute()
+                # clear the form so it's blank next time
+                for k in ("np_title", "np_loc", "np_year", "np_desc",
+                          "np_photos", "np_status"):
+                    st.session_state.pop(k, None)
                 st.success(f"Project added"
                            + (f" with {len(pphotos)} photo(s)." if pphotos
                               else "."))
@@ -1183,11 +1213,12 @@ def screen_my_profile(profile):
                 if up is None:
                     st.error("Choose a photo first.")
                 else:
+                    data, fname = photo_to_jpeg(up)
                     path = (f"portfolio/{st.session_state.user_id}/{p['id']}/"
-                            f"{int(time.time())}_{up.name}")
-                    mime = mimetypes.guess_type(up.name)[0] or "image/jpeg"
+                            f"{int(time.time())}_{fname}")
+                    mime = mimetypes.guess_type(fname)[0] or "image/jpeg"
                     sb().storage.from_("drawings").upload(
-                        path, up.getvalue(), {"content-type": mime})
+                        path, data, {"content-type": mime})
                     sb().table("project_photos").insert({
                         "project_id": p["id"], "path": path,
                         "caption": cap.strip() or None,
