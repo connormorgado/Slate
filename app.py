@@ -1134,20 +1134,29 @@ def screen_my_profile(profile):
                 f'on SLATE can see it. Add current and completed projects with '
                 f'photos.</div>', unsafe_allow_html=True)
 
-    with st.expander("➕ Add a project"):
-        title = st.text_input("Project title", key="np_title")
+    if "show_add_project" not in st.session_state:
+        st.session_state.show_add_project = False
+    toggle_label = ("➖ Close" if st.session_state.show_add_project
+                    else "➕ Add a project")
+    if st.button(toggle_label, key="toggle_add_project"):
+        st.session_state.show_add_project = not st.session_state.show_add_project
+        st.rerun()
+
+    if st.session_state.show_add_project:
+        fg = st.session_state.get("form_gen", 0)
+        title = st.text_input("Project title", key=f"np_title_{fg}")
         pstatus = st.radio("Status", ["Current", "Completed"], horizontal=True,
-                           key="np_status")
+                           key=f"np_status_{fg}")
         c1, c2 = st.columns(2)
-        ploc = c1.text_input("Location", key="np_loc")
-        pyear = c2.text_input("Year", key="np_year",
+        ploc = c1.text_input("Location", key=f"np_loc_{fg}")
+        pyear = c2.text_input("Year", key=f"np_year_{fg}",
                               placeholder="2026 or 2024–2025")
-        pdesc = st.text_area("Description (scope, size, role)", key="np_desc")
-        np_gen = st.session_state.get("photo_gen", 0)
+        pdesc = st.text_area("Description (scope, size, role)",
+                             key=f"np_desc_{fg}")
         pphotos = st.file_uploader("Upload photos (JPG/PNG/HEIC — select "
                                    "several at once)",
                                    accept_multiple_files=True,
-                                   key=f"np_photos_{np_gen}")
+                                   key=f"np_photos_{fg}")
         if st.button("Add project"):
             if not title.strip():
                 st.error("Project title is required.")
@@ -1171,14 +1180,10 @@ def screen_my_profile(profile):
                         "project_id": proj["id"], "path": path,
                         "caption": None,
                     }).execute()
-                # clear the form so it's blank next time
-                for k in ("np_title", "np_loc", "np_year", "np_desc",
-                          "np_status"):
-                    st.session_state.pop(k, None)
-                st.session_state.photo_gen = np_gen + 1  # clears the picker
-                st.success(f"Project added"
-                           + (f" with {len(pphotos)} photo(s)." if pphotos
-                              else "."))
+                # fresh widget identities = guaranteed-blank form next time
+                st.session_state.form_gen = fg + 1
+                # collapse the form; the new project appears below
+                st.session_state.show_add_project = False
                 st.rerun()
 
     projects = (sb().table("projects").select("*")
