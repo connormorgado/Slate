@@ -1118,18 +1118,34 @@ def screen_my_profile(profile):
         pyear = c2.text_input("Year", key="np_year",
                               placeholder="2026 or 2024–2025")
         pdesc = st.text_area("Description (scope, size, role)", key="np_desc")
+        pphotos = st.file_uploader("Upload photos (JPG/PNG — select several "
+                                   "at once)", accept_multiple_files=True,
+                                   key="np_photos")
         if st.button("Add project"):
             if not title.strip():
                 st.error("Project title is required.")
             else:
-                sb().table("projects").insert({
+                proj = (sb().table("projects").insert({
                     "owner_id": st.session_state.user_id,
                     "title": title.strip(),
                     "status": pstatus.lower(),
                     "location": ploc.strip() or None,
                     "year": pyear.strip() or None,
                     "description": pdesc.strip() or None,
-                }).execute()
+                }).execute().data)[0]
+                for ph in pphotos or []:
+                    path = (f"portfolio/{st.session_state.user_id}/"
+                            f"{proj['id']}/{int(time.time())}_{ph.name}")
+                    mime = mimetypes.guess_type(ph.name)[0] or "image/jpeg"
+                    sb().storage.from_("drawings").upload(
+                        path, ph.getvalue(), {"content-type": mime})
+                    sb().table("project_photos").insert({
+                        "project_id": proj["id"], "path": path,
+                        "caption": None,
+                    }).execute()
+                st.success(f"Project added"
+                           + (f" with {len(pphotos)} photo(s)." if pphotos
+                              else "."))
                 st.rerun()
 
     projects = (sb().table("projects").select("*")
@@ -1142,7 +1158,8 @@ def screen_my_profile(profile):
     for p in projects:
         with st.expander(f"{'🔨' if p['status'] == 'current' else '✅'} "
                          f"{p['title']} ({p['status']}"
-                         f"{', ' + p['year'] if p.get('year') else ''})"):
+                         f"{', ' + p['year'] if p.get('year') else ''})",
+                         expanded=True):
             if p.get("description"):
                 st.markdown(f'<div style="color:{C["ink"]}">{p["description"]}'
                             f'</div>', unsafe_allow_html=True)
@@ -1221,7 +1238,8 @@ def screen_public_profile(uid):
         for pr in group:
             with st.expander(f"{pr['title']}"
                              f"{' · ' + pr['year'] if pr.get('year') else ''}"
-                             f"{' · ' + pr['location'] if pr.get('location') else ''}"):
+                             f"{' · ' + pr['location'] if pr.get('location') else ''}",
+                             expanded=True):
                 if pr.get("description"):
                     st.markdown(f'<div style="color:{C["ink"]}">'
                                 f'{pr["description"]}</div>',
