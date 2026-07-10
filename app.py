@@ -103,37 +103,27 @@ section[data-testid="stSidebar"] * { color: #BFCCC2; }
   font-family:'Barlow Condensed',sans-serif; font-weight:600; letter-spacing:1px; }
 .stButton > button:hover { background:#14572F; color:#FFF; }
 
-/* ── Sidebar nav: no radio circles — sleek selectable rows ────────── */
-section[data-testid="stSidebar"] div[role="radiogroup"] {
-  display: flex; flex-direction: column; gap: 6px;
-}
-section[data-testid="stSidebar"] label[data-baseweb="radio"] {
-  width: 100%; margin: 0; padding: 10px 14px;
+/* ── Sidebar nav: real buttons, no radio circles ─────────────────── */
+section[data-testid="stSidebar"] .stButton > button {
+  width: 100%; justify-content: flex-start; text-align: left;
+  background: transparent; color: #BFCCC2;
   border: 1px solid rgba(110,232,110,0.10); border-radius: 6px;
-  background: transparent; cursor: pointer;
-  transition: border-color .15s ease, background .15s ease,
-              box-shadow .15s ease;
-}
-/* hide the circle itself */
-section[data-testid="stSidebar"] label[data-baseweb="radio"] > div:first-child {
-  display: none;
-}
-section[data-testid="stSidebar"] label[data-baseweb="radio"] p {
+  padding: 10px 14px;
   font-family: 'Barlow Condensed', sans-serif; font-weight: 600;
   letter-spacing: 1.5px; text-transform: uppercase; font-size: 15px;
-  color: #BFCCC2; margin: 0;
+  transition: border-color .15s ease, background .15s ease,
+              box-shadow .15s ease, color .15s ease;
 }
-/* hover: neon outline */
-section[data-testid="stSidebar"] label[data-baseweb="radio"]:hover {
+section[data-testid="stSidebar"] .stButton > button:hover {
   border-color: #6EE86E; background: rgba(110,232,110,0.06);
-}
-/* active page: filled tint + glow, matches the logo */
-section[data-testid="stSidebar"] label[data-baseweb="radio"]:has(input:checked) {
-  border-color: #6EE86E; background: rgba(110,232,110,0.12);
-  box-shadow: 0 0 12px rgba(110,232,110,0.22);
-}
-section[data-testid="stSidebar"] label[data-baseweb="radio"]:has(input:checked) p {
   color: #FFFFFF;
+}
+/* active page (rendered as a primary button) — filled tint + glow */
+section[data-testid="stSidebar"] .stButton > button[kind="primary"],
+section[data-testid="stSidebar"] .stButton > button[data-testid="baseButton-primary"] {
+  background: rgba(110,232,110,0.14); color: #FFFFFF;
+  border: 1px solid #6EE86E;
+  box-shadow: 0 0 12px rgba(110,232,110,0.22);
 }
 </style>
 """, unsafe_allow_html=True)
@@ -1267,16 +1257,20 @@ with st.sidebar:
                 f'{"GC" if profile["role"] == "gc" else "SUB"}{check}</div>',
                 unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
-    if profile["role"] == "gc":
-        page = st.radio("Navigate",
-                        ["My Profile", "Dashboard", "New Bid Request",
-                         "Bid Requests", "Sub Network", "Get Verified"],
-                        label_visibility="collapsed")
-    else:
-        page = st.radio("Navigate",
-                        ["My Profile", "Bid Invites", "RFP Board",
-                         "Get Verified"],
-                        label_visibility="collapsed")
+    nav_items = (["My Profile", "Dashboard", "New Bid Request",
+                  "Bid Requests", "Sub Network", "Get Verified"]
+                 if profile["role"] == "gc" else
+                 ["My Profile", "Bid Invites", "RFP Board", "Get Verified"])
+    if st.session_state.get("page") not in nav_items:
+        st.session_state.page = nav_items[0]
+    for item in nav_items:
+        active = st.session_state.page == item
+        if st.button(item, key=f"nav_{item}",
+                     type="primary" if active else "secondary"):
+            st.session_state.page = item
+            st.session_state.pop("view_profile", None)
+            st.rerun()
+    page = st.session_state.page
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("Log out"):
         sign_out()
