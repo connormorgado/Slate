@@ -625,6 +625,30 @@ def screen_gc_dashboard(profile):
         st.info("No bid requests yet — create your first one from **New Bid Request**.")
         return
 
+    # ── money + activity summary across all my RFPs ──
+    itb_ids = [i["id"] for i in itbs]
+    all_bids = (sb().table("bids").select("itb_id, sub_id, amount, revision")
+                .in_("itb_id", itb_ids).execute().data)
+    all_invites = (sb().table("itb_invites").select("itb_id, sub_id, status")
+                   .in_("itb_id", itb_ids).execute().data)
+    awarded_by_itb = {v["itb_id"]: v["sub_id"] for v in all_invites
+                      if v["status"] == "awarded"}
+    latest = {}
+    for b in all_bids:
+        k = (b["itb_id"], b["sub_id"])
+        if k not in latest or b["revision"] > latest[k]["revision"]:
+            latest[k] = b
+    awarded_total = sum(b["amount"] for (t, s), b in latest.items()
+                        if awarded_by_itb.get(t) == s)
+    under_review = sum(b["amount"] for (t, s), b in latest.items()
+                       if t not in awarded_by_itb)
+    bids_received = len(latest)
+    awaiting_subs = sum(1 for v in all_invites if v["status"] == "sent")
+    _stat_cards([("Awarded", f"${awarded_total:,.0f}"),
+                 ("Bids under review", f"${under_review:,.0f}"),
+                 ("Bids received", bids_received),
+                 ("Awaiting sub response", awaiting_subs)])
+
     for itb in itbs:
         invites = (sb().table("itb_invites").select("id, sub_id, status")
                    .eq("itb_id", itb["id"]).execute().data)
@@ -722,6 +746,28 @@ def screen_sub_inbox(profile):
         st.info("No bid invites yet. When a GC sends you one, it lands here "
                 "and in your email.")
         return
+
+    # ── money + activity summary ──
+    my_bids = (sb().table("bids").select("itb_id, amount, revision")
+               .eq("sub_id", st.session_state.user_id).execute().data)
+    latest_by_itb = {}
+    for b in my_bids:
+        cur = latest_by_itb.get(b["itb_id"])
+        if cur is None or b["revision"] > cur["revision"]:
+            latest_by_itb[b["itb_id"]] = b
+    status_by_itb = {v["itb_id"]: v["status"] for v in invites}
+    outstanding = sum(b["amount"] for t, b in latest_by_itb.items()
+                      if status_by_itb.get(t) == "responded")
+    awarded_amt = sum(b["amount"] for t, b in latest_by_itb.items()
+                      if status_by_itb.get(t) == "awarded")
+    awaiting_you = sum(1 for v in invites if v["status"] == "sent")
+    responded_ct = sum(1 for v in invites
+                       if v["status"] in ("responded", "awarded",
+                                          "not_selected"))
+    _stat_cards([("Bids outstanding", f"${outstanding:,.0f}"),
+                 ("Awarded to you", f"${awarded_amt:,.0f}"),
+                 ("Awaiting your bid", awaiting_you),
+                 ("Responded", responded_ct)])
 
     BADGES = {"sent": "🟠 AWAITING YOUR BID", "responded": "✅ RESPONDED",
               "awarded": "🏆 AWARDED TO YOU", "not_selected": "◻️ NOT SELECTED",
