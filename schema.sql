@@ -31,6 +31,12 @@ create table if not exists itbs (
   trade       text not null,
   scope       text,
   due_date    date,
+  visibility  text not null default 'invite'
+      check (visibility in ('invite','public','both')),
+  location    text,
+  start_date  date,
+  end_date    date,
+  budget_note text,
   created_at  timestamptz default now()
 );
 
@@ -114,6 +120,9 @@ create policy "gc reads own itbs"
   using (gc_id = auth.uid() or public.is_invited_to_itb(id));
 create policy "gc creates itbs"
   on itbs for insert to authenticated with check (gc_id = auth.uid());
+create policy "public rfps readable by signed-in users"
+  on itbs for select to authenticated
+  using (visibility in ('public','both'));
 
 -- Files: visible to whoever can see the ITB; only the owning GC adds.
 create policy "read files on visible itbs"
@@ -185,3 +194,93 @@ create policy "signed-in users upload drawings"
 create policy "signed-in users read drawings"
   on storage.objects for select to authenticated
   using (bucket_id = 'drawings');
+
+
+-- ═══ RFP BOARD: request-to-bid queue ═══
+ create table if not exists bid_requests (
+  id          bigint generated always as identity primary key,
+  itb_id      bigint not null references itbs(id) on delete cascade,
+  sub_id      uuid not null references profiles(id),
+  message     text,
+  status      text not null default 'requested'
+      check (status in ('requested','approved','rejected')),
+  created_at  timestamptz default now(),
+  unique (itb_id, sub_id)
+);
+
+alter table bid_requests enable row level security;
+
+-- The sub sees their own requests; the GC sees requests on their RFPs.
+create policy "read own or owned bid requests"
+  on bid_requests for select to authenticated
+  using (sub_id = auth.uid()
+         or exists (select 1 from itbs i
+                    where i.id = bid_requests.itb_id
+                    and i.gc_id = auth.uid()));
+
+-- Only VERIFIED subs can request, and only on public/both RFPs.
+create policy "verified sub requests to bid"
+  on bid_requests for insert to authenticated
+  with check (sub_id = auth.uid()
+              and exists (select 1 from profiles p
+                          where p.id = auth.uid()
+                          and p.verification_status = 'verified')
+              and exists (select 1 from itbs i
+                          where i.id = bid_requests.itb_id
+                          and i.visibility in ('public','both')));
+
+-- The GC accepts/rejects requests on their own RFPs.
+create policy "gc updates requests on own rfps"
+  on bid_requests for update to authenticated
+  using (exists (select 1 from itbs i
+                 where i.id = bid_requests.itb_id
+                 and i.gc_id = auth.uid()));
+
+
+-- ═══ PROFILES: project portfolios ═══
+create table if not exists projects (
+  id          bigint generated always as identity primary key,
+  owner_id    uuid not null references profiles(id) on delete cascade,
+  title       text not null,
+  status      text not null default 'completed'
+      check (status in ('current','completed')),
+  description text,
+  location    text,
+  year        text,
+  created_at  timestamptz default now()
+);
+
+create table if not exists project_photos (
+  id          bigint generated always as identity primary key,
+  project_id  bigint not null references projects(id) on delete cascade,
+  path        text not null,   -- storage path inside the 'drawings' bucket
+  caption     text
+);
+
+alter table projects       enable row level security;
+alter table project_photos enable row level security;
+
+-- Portfolios are social: any signed-in user can view.
+create policy "projects readable by signed-in users"
+  on projects for select to authenticated using (true);
+create policy "photos readable by signed-in users"
+  on project_photos for select to authenticated using (true);
+
+-- You manage only your own portfolio.
+create policy "insert own projects"
+  on projects for insert to authenticated with check (owner_id = auth.uid());
+create policy "update own projects"
+  on projects for update to authenticated using (owner_id = auth.uid());
+create policy "delete own projects"
+  on projects for delete to authenticated using (owner_id = auth.uid());
+
+create policy "add photos to own projects"
+  on project_photos for insert to authenticated
+  with check (exists (select 1 from projects p
+                      where p.id = project_photos.project_id
+                      and p.owner_id = auth.uid()));
+create policy "delete photos on own projects"
+  on project_photos for delete to authenticated
+  using (exists (select 1 from projects p
+                 where p.id = project_photos.project_id
+                 and p.owner_id = auth.uid()));

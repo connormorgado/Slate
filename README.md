@@ -118,3 +118,31 @@ Pilot-level caveat: verification runs client-side with the user's own
 database permissions, so a technically savvy user could theoretically
 self-verify via the API. Fine for a trusted pilot; move the decision into
 a Supabase Edge Function before opening signups to strangers.
+
+## Migrations 004 + 005 — public RFP board & contractor profiles
+
+Run `migration_004.sql` then `migration_005.sql` once each in the SQL Editor
+(existing projects; fresh installs get everything from schema.sql).
+
+**Public RFP board.** Posting a bid request now has a visibility choice:
+invite-only (how it worked before), public on the RFP board, or both.
+Public postings show the GC, scope, location, expected start/end, due date,
+and optional budget note. Attachments stay locked until a sub is approved.
+
+**Request to bid.** Subs browse the board (verified or not) but must be
+verified to request permission. GCs approve/reject from the new
+**Bid Requests** page — approval creates the invite, unlocks drawings, and
+emails the sub. Pending requests show a 🔔 count on the dashboard.
+
+**Profiles & portfolios.** Everyone gets **My Profile**: current and
+completed projects with photos and captions — evidence of excellence.
+View anyone's profile from the RFP board, Sub Network, or Bid Requests.
+
+**Smoke test checklist for this release:**
+1. GC: post an RFP with visibility "Both", one PDF, no invited subs
+2. Sub (verified): find it on RFP Board -> Request to Bid with a message
+3. GC: Dashboard shows 🔔 -> Bid Requests -> View profile -> Approve
+4. Sub: invite appears in Bid Invites with the PDF downloadable -> bid
+5. Sub: My Profile -> add a project + photo with caption
+6. GC: Sub Network -> View profile -> see the project and photo
+7. Unverified account: can browse RFP Board, gets verify prompt on request

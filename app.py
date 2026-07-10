@@ -200,6 +200,23 @@ def send_itb_email(to_email, gc_company, project, trade, due, app_url):
         return False, str(e)
 
 
+def send_simple_email(to_email, subject, html):
+    """Generic notification email — degrades gracefully with no key."""
+    api_key = st.secrets.get("RESEND_API_KEY")
+    if not api_key:
+        return False
+    try:
+        r = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"from": st.secrets.get("EMAIL_FROM", "SLATE <onboarding@resend.dev>"),
+                  "to": [to_email], "subject": subject, "html": html},
+            timeout=15)
+        return r.status_code in (200, 201)
+    except requests.RequestException:
+        return False
+
+
 # ─────────────────────────────────────────────────────────────────────
 #  SCREEN: LOGIN / SIGN UP
 # ─────────────────────────────────────────────────────────────────────
@@ -450,40 +467,66 @@ def screen_new_itb(profile):
             .select("id, company, trade, region, email")
             .eq("role", "sub")
             .eq("verification_status", "verified").execute().data)
-    if not subs:
-        st.info("No verified subcontractors yet. Subs appear here once they "
-                "complete CSLB verification — invite yours to sign up and "
-                "hit **Get Verified**.")
-        return
+
+    vis_label = st.radio(
+        "Who can see this?",
+        ["Invite specific subs only", "Post publicly on the RFP board",
+         "Both — post publicly AND invite specific subs"],
+        help="Public RFPs are browsable by all subs. Subs you don't invite "
+             "directly must request permission to bid; you approve or reject "
+             "them from Bid Requests. Attachments unlock only for approved/"
+             "invited subs.")
+    visibility = {"Invite specific subs only": "invite",
+                  "Post publicly on the RFP board": "public",
+                  "Both — post publicly AND invite specific subs": "both"}[vis_label]
 
     project = st.text_input("Project", placeholder="Lariat Ln Residence — 3,750 SF New Build")
     trade = st.text_input("Trade package", placeholder="Framing Package")
     scope = st.text_area("Scope of work")
-    due = st.date_input("Bids due")
-    files = st.file_uploader("Drawings / scope docs (PDF, DOCX)",
+    location = st.text_input("Location", placeholder="San Jose, CA (East Foothills)")
+    c1, c2, c3 = st.columns(3)
+    start = c1.date_input("Expected start")
+    end = c2.date_input("Expected end")
+    due = c3.date_input("Bids due")
+    budget_note = st.text_input("Budget note (optional, shown publicly)",
+                                placeholder="e.g. Budget range available on request")
+    files = st.file_uploader("Drawings / specs / schedule (PDF, DOCX)",
                              accept_multiple_files=True)
 
-    st.markdown('<div class="eyebrow" style="margin-top:8px">SELECT SUBS</div>',
-                unsafe_allow_html=True)
     picked = []
-    for s in subs:
-        label = f"{s['company']} — {s.get('trade') or 'trade not set'} · {s.get('region') or ''}"
-        if st.checkbox(label, key=f"sub_{s['id']}"):
-            picked.append(s)
+    if visibility in ("invite", "both"):
+        st.markdown('<div class="eyebrow" style="margin-top:8px">SELECT SUBS '
+                    'TO INVITE DIRECTLY</div>', unsafe_allow_html=True)
+        if not subs:
+            st.info("No verified subs to invite yet — they appear here once "
+                    "they complete CSLB verification.")
+        for s in subs:
+            label = f"{s['company']} — {s.get('trade') or 'trade not set'} · {s.get('region') or ''}"
+            if st.checkbox(label, key=f"sub_{s['id']}"):
+                picked.append(s)
 
-    if st.button("Send Bid Request"):
-        if not (project.strip() and trade.strip() and picked):
-            st.error("Project, trade package, and at least one sub are required.")
+    if st.button("Post Bid Request"):
+        if not (project.strip() and trade.strip()):
+            st.error("Project and trade package are required.")
+            return
+        if visibility == "invite" and not picked:
+            st.error("Invite-only bid requests need at least one sub selected "
+                     "— or switch to a public posting.")
             return
 
         with st.spinner("Creating bid request…"):
-            # 1. the ITB row
+            # 1. the ITB/RFP row
             itb = (sb().table("itbs").insert({
                 "gc_id": st.session_state.user_id,
                 "project": project.strip(),
                 "trade": trade.strip(),
                 "scope": scope.strip() or None,
                 "due_date": due.isoformat(),
+                "visibility": visibility,
+                "location": location.strip() or None,
+                "start_date": start.isoformat(),
+                "end_date": end.isoformat(),
+                "budget_note": budget_note.strip() or None,
             }).execute().data)[0]
 
             # 2. upload files to the private bucket, record paths
@@ -496,7 +539,7 @@ def screen_new_itb(profile):
                     "itb_id": itb["id"], "path": path, "filename": f.name,
                 }).execute()
 
-            # 3. invites + emails
+            # 3. direct invites + emails
             app_url = st.secrets.get("APP_URL", "https://share.streamlit.io")
             emailed, failed = 0, 0
             for s in picked:
@@ -508,10 +551,15 @@ def screen_new_itb(profile):
                 emailed += ok
                 failed += (not ok)
 
-        st.success(f"Bid request sent to {len(picked)} sub(s). "
-                   f"Emails delivered: {emailed}."
-                   + (f" Email failures: {failed} — invites still show in their "
-                      f"SLATE inbox." if failed else ""))
+        bits = []
+        if visibility in ("public", "both"):
+            bits.append("posted to the public RFP board")
+        if picked:
+            bits.append(f"sent to {len(picked)} invited sub(s), "
+                        f"{emailed} email(s) delivered")
+        st.success("Bid request " + " and ".join(bits) + "."
+                   + (f" Email failures: {failed} — invites still show in "
+                      f"their SLATE inbox." if failed else ""))
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -532,10 +580,15 @@ def screen_gc_dashboard(profile):
                    .eq("itb_id", itb["id"]).execute().data)
         bids = (sb().table("bids").select("*")
                 .eq("itb_id", itb["id"]).execute().data)
+        pending_reqs = (sb().table("bid_requests").select("id")
+                        .eq("itb_id", itb["id"])
+                        .eq("status", "requested").execute().data)
         latest = latest_bids_by_sub(bids)
         responded = sum(1 for v in invites if v["status"] in ("responded", "awarded"))
         awarded = next((v for v in invites if v["status"] == "awarded"), None)
         title_flag = " · 🏆 AWARDED" if awarded else ""
+        if pending_reqs:
+            title_flag += f" · 🔔 {len(pending_reqs)} bid request(s) pending"
 
         with st.expander(f"ITB-{itb['id']:04d} · {itb['project']} — {itb['trade']} "
                          f"({responded}/{len(invites)} responded, "
@@ -737,6 +790,9 @@ def screen_network():
             f'{s.get("trade") or "trade not set"} · {s.get("region") or ""} · '
             f'CSLB {s.get("license_no") or "—"}</div></div>',
             unsafe_allow_html=True)
+        if st.button("View profile", key=f"netprof_{s['id']}"):
+            st.session_state.view_profile = s["id"]
+            st.rerun()
         if s.get("license_no"):
             if st.button(f"Verify CSLB #{s['license_no']}", key=f"cslb_{s['id']}"):
                 with st.spinner("Checking CSLB…"):
@@ -752,6 +808,314 @@ def screen_network():
                     st.warning(f"Couldn't verify automatically "
                                f"({res.get('error', 'lookup failed')}). "
                                f"[Check manually on CSLB]({res['url']})")
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  SUB SCREEN: RFP BOARD  (browse public postings -> request to bid)
+# ─────────────────────────────────────────────────────────────────────
+def screen_rfp_board(profile):
+    heading("RFP BOARD")
+    st.markdown(f'<div style="color:{C["inkSoft"]};margin-bottom:8px">Open '
+                f'bid requests posted publicly by verified GCs. Request '
+                f'permission to bid — once the GC approves, the RFP lands in '
+                f'your Bid Invites with drawings unlocked.</div>',
+                unsafe_allow_html=True)
+
+    rfps = (sb().table("itbs").select("*")
+            .in_("visibility", ["public", "both"])
+            .order("created_at", desc=True).execute().data)
+    if not rfps:
+        st.info("No public RFPs posted yet — check back soon.")
+        return
+
+    # my existing invites + requests, to label each card correctly
+    my_invites = {v["itb_id"] for v in
+                  sb().table("itb_invites").select("itb_id")
+                  .eq("sub_id", st.session_state.user_id).execute().data}
+    my_requests = {r["itb_id"]: r for r in
+                   sb().table("bid_requests").select("itb_id, status")
+                   .eq("sub_id", st.session_state.user_id).execute().data}
+    gc_names = {p["id"]: p["company"] for p in
+                sb().table("profiles").select("id, company")
+                .in_("id", list({r["gc_id"] for r in rfps})).execute().data}
+
+    for r in rfps:
+        gc_name = gc_names.get(r["gc_id"], "GC")
+        with st.expander(f"{r['project']} — {r['trade']} · {gc_name} "
+                         f"(bids due {r['due_date']})"):
+            meta = (f'📍 {r.get("location") or "location TBD"} · '
+                    f'🗓 {r.get("start_date") or "TBD"} → {r.get("end_date") or "TBD"}')
+            if r.get("budget_note"):
+                meta += f' · 💲 {r["budget_note"]}'
+            st.markdown(
+                f'<div class="f-mono" style="font-size:11px;color:{C["inkSoft"]}">'
+                f'{meta}</div>', unsafe_allow_html=True)
+            if r.get("scope"):
+                st.markdown(f'<div class="eyebrow" style="margin-top:6px">SCOPE'
+                            f'</div><div style="color:{C["ink"]}">{r["scope"]}'
+                            f'</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="f-mono" style="font-size:11px;'
+                        f'color:{C["inkSoft"]};margin-top:6px">Drawings & specs '
+                        f'unlock once you\'re approved to bid.</div>',
+                        unsafe_allow_html=True)
+            if st.button(f"View {gc_name}'s profile", key=f"gcprof_{r['id']}"):
+                st.session_state.view_profile = r["gc_id"]
+                st.rerun()
+
+            # this sub's standing on this RFP
+            if r["id"] in my_invites:
+                st.success("You're on this bid list — see **Bid Invites** to respond.")
+            elif r["id"] in my_requests:
+                rq = my_requests[r["id"]]
+                if rq["status"] == "requested":
+                    st.info("⏳ Bid request sent — waiting on the GC.")
+                elif rq["status"] == "approved":
+                    st.success("Approved — see **Bid Invites** to respond.")
+                else:
+                    st.markdown(f'<div style="color:{C["inkSoft"]}">The GC '
+                                f'didn\'t approve your request on this one. '
+                                f'Your record isn\'t affected.</div>',
+                                unsafe_allow_html=True)
+            elif not is_verified(profile):
+                st.warning("Get verified to request permission to bid — open "
+                           "**Get Verified** in the sidebar.")
+            else:
+                msg = st.text_input("Message to the GC (optional — e.g. crew "
+                                    "availability, relevant experience)",
+                                    key=f"reqmsg_{r['id']}")
+                if st.button("Request to Bid", key=f"req_{r['id']}"):
+                    sb().table("bid_requests").insert({
+                        "itb_id": r["id"],
+                        "sub_id": st.session_state.user_id,
+                        "message": msg.strip() or None,
+                    }).execute()
+                    st.success("Request sent — the GC will approve or decline.")
+                    st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  GC SCREEN: BID REQUESTS  (approve/reject subs asking to bid)
+# ─────────────────────────────────────────────────────────────────────
+def screen_gc_requests(profile):
+    heading("BID REQUESTS")
+    my_itbs = {i["id"]: i for i in
+               sb().table("itbs").select("id, project, trade, due_date")
+               .eq("gc_id", st.session_state.user_id).execute().data}
+    if not my_itbs:
+        st.info("No bid requests yet — they arrive when subs ask to bid on "
+                "your public RFPs.")
+        return
+    reqs = (sb().table("bid_requests").select("*")
+            .in_("itb_id", list(my_itbs.keys()))
+            .order("created_at", desc=True).execute().data)
+    if not reqs:
+        st.info("No sub requests yet on your public RFPs.")
+        return
+
+    sub_profiles = {p["id"]: p for p in
+                    sb().table("profiles")
+                    .select("id, company, trade, region, verification_status")
+                    .in_("id", list({r["sub_id"] for r in reqs})).execute().data}
+
+    pending = [r for r in reqs if r["status"] == "requested"]
+    decided = [r for r in reqs if r["status"] != "requested"]
+
+    for group, title in ((pending, "AWAITING YOUR DECISION"),
+                         (decided, "DECIDED")):
+        if not group:
+            continue
+        st.markdown(f'<div class="eyebrow" style="margin-top:8px">{title}</div>',
+                    unsafe_allow_html=True)
+        for rq in group:
+            itb = my_itbs[rq["itb_id"]]
+            s = sub_profiles.get(rq["sub_id"], {})
+            st.markdown(
+                f'<div class="card"><b>{s.get("company","Sub")}</b>'
+                f'{verified_badge(s)}'
+                f'<div class="f-mono" style="font-size:11px;color:{C["inkSoft"]}">'
+                f'{s.get("trade") or ""} · {s.get("region") or ""} — wants to bid '
+                f'on <b>{itb["project"]} / {itb["trade"]}</b></div>'
+                + (f'<div style="color:{C["ink"]};font-size:14px;margin-top:4px">'
+                   f'"{rq["message"]}"</div>' if rq.get("message") else "")
+                + (f'<div class="f-mono" style="font-size:11px;'
+                   f'color:{C["inkSoft"]};margin-top:4px">STATUS: '
+                   f'{rq["status"].upper()}</div>' if rq["status"] != "requested" else "")
+                + '</div>', unsafe_allow_html=True)
+            b1, b2, b3 = st.columns([1, 1, 2])
+            if b1.button("View profile", key=f"vp_{rq['id']}"):
+                st.session_state.view_profile = rq["sub_id"]
+                st.rerun()
+            if rq["status"] == "requested":
+                if b2.button("Approve", key=f"ok_{rq['id']}"):
+                    existing = (sb().table("itb_invites").select("id")
+                                .eq("itb_id", rq["itb_id"])
+                                .eq("sub_id", rq["sub_id"]).execute().data)
+                    if not existing:
+                        sb().table("itb_invites").insert({
+                            "itb_id": rq["itb_id"], "sub_id": rq["sub_id"],
+                        }).execute()
+                    sb().table("bid_requests").update(
+                        {"status": "approved"}).eq("id", rq["id"]).execute()
+                    sub_email = (sb().table("profiles").select("email")
+                                 .eq("id", rq["sub_id"]).execute().data)
+                    if sub_email:
+                        app_url = st.secrets.get("APP_URL",
+                                                 "https://share.streamlit.io")
+                        send_simple_email(
+                            sub_email[0]["email"],
+                            f"Approved to bid: {itb['project']}",
+                            f"<p><b>{profile['company']}</b> approved your "
+                            f"request to bid on <b>{itb['project']} — "
+                            f"{itb['trade']}</b> (due {itb['due_date']}).</p>"
+                            f"<p><a href='{app_url}'>Log in to SLATE</a> — "
+                            f"it's in your Bid Invites with drawings unlocked.</p>")
+                    st.rerun()
+                if b3.button("Reject", key=f"no_{rq['id']}"):
+                    sb().table("bid_requests").update(
+                        {"status": "rejected"}).eq("id", rq["id"]).execute()
+                    st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  SCREEN: MY PROFILE  (portfolio editor — GCs and subs)
+# ─────────────────────────────────────────────────────────────────────
+def screen_my_profile(profile):
+    heading("MY PROFILE")
+    st.markdown(
+        f'<div class="card"><b>{profile["company"]}</b>{verified_badge(profile)}'
+        f'<div class="f-mono" style="font-size:11px;color:{C["inkSoft"]}">'
+        f'{"GC" if profile["role"] == "gc" else profile.get("trade") or "Sub"} · '
+        f'{profile.get("region") or ""} · CSLB {profile.get("license_no") or "—"}'
+        f'</div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div style="color:{C["inkSoft"]};margin-bottom:6px">Your '
+                f'portfolio is your evidence of excellence — every GC and sub '
+                f'on SLATE can see it. Add current and completed projects with '
+                f'photos.</div>', unsafe_allow_html=True)
+
+    with st.expander("➕ Add a project"):
+        title = st.text_input("Project title", key="np_title")
+        pstatus = st.radio("Status", ["Current", "Completed"], horizontal=True,
+                           key="np_status")
+        c1, c2 = st.columns(2)
+        ploc = c1.text_input("Location", key="np_loc")
+        pyear = c2.text_input("Year", key="np_year",
+                              placeholder="2026 or 2024–2025")
+        pdesc = st.text_area("Description (scope, size, role)", key="np_desc")
+        if st.button("Add project"):
+            if not title.strip():
+                st.error("Project title is required.")
+            else:
+                sb().table("projects").insert({
+                    "owner_id": st.session_state.user_id,
+                    "title": title.strip(),
+                    "status": pstatus.lower(),
+                    "location": ploc.strip() or None,
+                    "year": pyear.strip() or None,
+                    "description": pdesc.strip() or None,
+                }).execute()
+                st.rerun()
+
+    projects = (sb().table("projects").select("*")
+                .eq("owner_id", st.session_state.user_id)
+                .order("created_at", desc=True).execute().data)
+    if not projects:
+        st.info("No projects yet — add your first one above.")
+        return
+
+    for p in projects:
+        with st.expander(f"{'🔨' if p['status'] == 'current' else '✅'} "
+                         f"{p['title']} ({p['status']}"
+                         f"{', ' + p['year'] if p.get('year') else ''})"):
+            if p.get("description"):
+                st.markdown(f'<div style="color:{C["ink"]}">{p["description"]}'
+                            f'</div>', unsafe_allow_html=True)
+            photos = (sb().table("project_photos").select("*")
+                      .eq("project_id", p["id"]).execute().data)
+            if photos:
+                cols = st.columns(3)
+                for i, ph in enumerate(photos):
+                    url = signed_link(ph["path"])
+                    if url:
+                        cols[i % 3].image(url, caption=ph.get("caption") or "")
+                    if cols[i % 3].button("Remove", key=f"delph_{ph['id']}"):
+                        sb().table("project_photos").delete().eq(
+                            "id", ph["id"]).execute()
+                        st.rerun()
+
+            up = st.file_uploader("Add a photo (JPG/PNG)", key=f"up_{p['id']}")
+            cap = st.text_input("Photo caption", key=f"cap_{p['id']}",
+                                placeholder="e.g. Finished kitchen — custom cabinetry")
+            if st.button("Upload photo", key=f"addph_{p['id']}"):
+                if up is None:
+                    st.error("Choose a photo first.")
+                else:
+                    path = (f"portfolio/{st.session_state.user_id}/{p['id']}/"
+                            f"{int(time.time())}_{up.name}")
+                    mime = mimetypes.guess_type(up.name)[0] or "image/jpeg"
+                    sb().storage.from_("drawings").upload(
+                        path, up.getvalue(), {"content-type": mime})
+                    sb().table("project_photos").insert({
+                        "project_id": p["id"], "path": path,
+                        "caption": cap.strip() or None,
+                    }).execute()
+                    st.rerun()
+
+            if st.button("Delete this project", key=f"delp_{p['id']}"):
+                sb().table("projects").delete().eq("id", p["id"]).execute()
+                st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  SCREEN: PUBLIC PROFILE VIEW  (anyone signed-in, via View Profile)
+# ─────────────────────────────────────────────────────────────────────
+def screen_public_profile(uid):
+    rows = (sb().table("profiles")
+            .select("id, company, role, trade, region, license_no, "
+                    "verification_status, cslb_expires")
+            .eq("id", uid).execute().data)
+    if not rows:
+        st.error("Profile not found.")
+        return
+    p = rows[0]
+    if st.button("← Back"):
+        st.session_state.pop("view_profile", None)
+        st.rerun()
+    heading(p["company"].upper())
+    st.markdown(
+        f'<div class="card">{verified_badge(p) or "Not yet verified"}'
+        f'<div class="f-mono" style="font-size:11px;color:{C["inkSoft"]}">'
+        f'{"General Contractor" if p["role"] == "gc" else p.get("trade") or "Subcontractor"} · '
+        f'{p.get("region") or ""} · CSLB {p.get("license_no") or "—"}'
+        + (f' · expires {p["cslb_expires"]}' if p.get("cslb_expires") else "")
+        + '</div></div>', unsafe_allow_html=True)
+
+    projects = (sb().table("projects").select("*").eq("owner_id", uid)
+                .order("created_at", desc=True).execute().data)
+    if not projects:
+        st.info("No portfolio projects posted yet.")
+        return
+    for status, label in (("current", "CURRENT WORK"),
+                          ("completed", "COMPLETED WORK")):
+        group = [p2 for p2 in projects if p2["status"] == status]
+        if not group:
+            continue
+        st.markdown(f'<div class="eyebrow" style="margin-top:10px">{label}</div>',
+                    unsafe_allow_html=True)
+        for pr in group:
+            with st.expander(f"{pr['title']}"
+                             f"{' · ' + pr['year'] if pr.get('year') else ''}"
+                             f"{' · ' + pr['location'] if pr.get('location') else ''}"):
+                if pr.get("description"):
+                    st.markdown(f'<div style="color:{C["ink"]}">'
+                                f'{pr["description"]}</div>',
+                                unsafe_allow_html=True)
+                photos = (sb().table("project_photos").select("path, caption")
+                          .eq("project_id", pr["id"]).execute().data)
+                cols = st.columns(3)
+                for i, ph in enumerate(photos):
+                    url = signed_link(ph["path"])
+                    if url:
+                        cols[i % 3].image(url, caption=ph.get("caption") or "")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -778,25 +1142,37 @@ with st.sidebar:
     st.markdown("<br>", unsafe_allow_html=True)
     if profile["role"] == "gc":
         page = st.radio("Navigate",
-                        ["Dashboard", "New Bid Request", "Sub Network",
-                         "Get Verified"],
+                        ["Dashboard", "New Bid Request", "Bid Requests",
+                         "Sub Network", "My Profile", "Get Verified"],
                         label_visibility="collapsed")
     else:
-        page = st.radio("Navigate", ["Bid Invites", "Get Verified"],
+        page = st.radio("Navigate",
+                        ["Bid Invites", "RFP Board", "My Profile",
+                         "Get Verified"],
                         label_visibility="collapsed")
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("Log out"):
         sign_out()
         st.rerun()
 
-if page == "Get Verified":
+# Viewing someone's profile takes over the page until Back is clicked
+if st.session_state.get("view_profile"):
+    screen_public_profile(st.session_state.view_profile)
+elif page == "Get Verified":
     screen_verify(profile)
+elif page == "My Profile":
+    screen_my_profile(profile)
 elif profile["role"] == "gc":
     if page == "Dashboard":
         screen_gc_dashboard(profile)
     elif page == "New Bid Request":
         screen_new_itb(profile)
+    elif page == "Bid Requests":
+        screen_gc_requests(profile)
     else:
         screen_network()
 else:
-    screen_sub_inbox(profile)
+    if page == "RFP Board":
+        screen_rfp_board(profile)
+    else:
+        screen_sub_inbox(profile)
