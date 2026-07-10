@@ -34,7 +34,7 @@ import mimetypes
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import requests
 import streamlit as st
@@ -102,6 +102,39 @@ section[data-testid="stSidebar"] * { color: #BFCCC2; }
 .stButton > button { background:#1D7A44; color:#FFF; border:none; border-radius:3px;
   font-family:'Barlow Condensed',sans-serif; font-weight:600; letter-spacing:1px; }
 .stButton > button:hover { background:#14572F; color:#FFF; }
+
+/* ── Sidebar nav: no radio circles — sleek selectable rows ────────── */
+section[data-testid="stSidebar"] div[role="radiogroup"] {
+  display: flex; flex-direction: column; gap: 6px;
+}
+section[data-testid="stSidebar"] label[data-baseweb="radio"] {
+  width: 100%; margin: 0; padding: 10px 14px;
+  border: 1px solid rgba(110,232,110,0.10); border-radius: 6px;
+  background: transparent; cursor: pointer;
+  transition: border-color .15s ease, background .15s ease,
+              box-shadow .15s ease;
+}
+/* hide the circle itself */
+section[data-testid="stSidebar"] label[data-baseweb="radio"] > div:first-child {
+  display: none;
+}
+section[data-testid="stSidebar"] label[data-baseweb="radio"] p {
+  font-family: 'Barlow Condensed', sans-serif; font-weight: 600;
+  letter-spacing: 1.5px; text-transform: uppercase; font-size: 15px;
+  color: #BFCCC2; margin: 0;
+}
+/* hover: neon outline */
+section[data-testid="stSidebar"] label[data-baseweb="radio"]:hover {
+  border-color: #6EE86E; background: rgba(110,232,110,0.06);
+}
+/* active page: filled tint + glow, matches the logo */
+section[data-testid="stSidebar"] label[data-baseweb="radio"]:has(input:checked) {
+  border-color: #6EE86E; background: rgba(110,232,110,0.12);
+  box-shadow: 0 0 12px rgba(110,232,110,0.22);
+}
+section[data-testid="stSidebar"] label[data-baseweb="radio"]:has(input:checked) p {
+  color: #FFFFFF;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -255,6 +288,7 @@ def screen_auth():
 # ─────────────────────────────────────────────────────────────────────
 def screen_onboarding():
     heading("SET UP YOUR PROFILE")
+    contact = st.text_input("Your name", placeholder="First and last")
     role = st.radio("I am a…", ["General Contractor", "Subcontractor"], horizontal=True)
     company = st.text_input("Company name")
     trade, license_no = None, None
@@ -271,6 +305,7 @@ def screen_onboarding():
             "email": st.session_state.user_email,
             "role": "gc" if role == "General Contractor" else "sub",
             "company": company.strip(),
+            "contact_name": contact.strip() or None,
             "trade": (trade or "").strip() or None,
             "license_no": (license_no or "").strip() or None,
             "region": region.strip() or None,
@@ -979,8 +1014,100 @@ def screen_gc_requests(profile):
 # ─────────────────────────────────────────────────────────────────────
 #  SCREEN: MY PROFILE  (portfolio editor — GCs and subs)
 # ─────────────────────────────────────────────────────────────────────
+def _stat_cards(stats):
+    """Row of metric cards: list of (label, value) tuples."""
+    cols = st.columns(len(stats))
+    for col, (label, val) in zip(cols, stats):
+        with col:
+            col.markdown(
+                f'<div class="card"><div class="eyebrow">{label}</div>'
+                f'<div class="metric-val" style="color:{C["ink"]}">{val}</div>'
+                f'</div>', unsafe_allow_html=True)
+
+
+def _week_window():
+    today = date.today()
+    return today, today + timedelta(days=7)
+
+
 def screen_my_profile(profile):
-    heading("MY PROFILE")
+    # Personal greeting — first name if we have it, company otherwise
+    who = ((profile.get("contact_name") or "").strip().split()[0]
+           if (profile.get("contact_name") or "").strip()
+           else profile["company"])
+    st.markdown(f'<div class="eyebrow">WELCOME BACK</div>'
+                f'<div class="f-disp" style="font-size:30px;font-weight:700;'
+                f'color:{C["ink"]};margin-bottom:6px">{who}, let\'s jump '
+                f'back in.</div>', unsafe_allow_html=True)
+    verification_banner(profile)
+
+    # one-time nudge for accounts created before names were collected
+    if not (profile.get("contact_name") or "").strip():
+        with st.expander("Add your name for a personal touch"):
+            nm = st.text_input("Your name", key="add_contact_name")
+            if st.button("Save name"):
+                if nm.strip():
+                    sb().table("profiles").update(
+                        {"contact_name": nm.strip()}).eq(
+                        "id", st.session_state.user_id).execute()
+                    st.session_state.profile = {**profile,
+                                                "contact_name": nm.strip()}
+                    st.rerun()
+
+    # ── Owner-only activity dashboard (never shown on the public view) ─
+    uid = st.session_state.user_id
+    today, week_out = _week_window()
+
+    if profile["role"] == "gc":
+        itbs = (sb().table("itbs").select("id, due_date")
+                .eq("gc_id", uid).execute().data)
+        itb_ids = [i["id"] for i in itbs]
+        invites, requests = [], []
+        if itb_ids:
+            invites = (sb().table("itb_invites").select("itb_id, status")
+                       .in_("itb_id", itb_ids).execute().data)
+            requests = (sb().table("bid_requests").select("id, status")
+                        .in_("itb_id", itb_ids).execute().data)
+        awarded_itbs = {v["itb_id"] for v in invites if v["status"] == "awarded"}
+        open_rfps = len([i for i in itbs if i["id"] not in awarded_itbs])
+        due_week = len([i for i in itbs
+                        if i["id"] not in awarded_itbs and i.get("due_date")
+                        and today <= date.fromisoformat(i["due_date"]) <= week_out])
+        responses = len([v for v in invites
+                         if v["status"] in ("responded", "awarded")])
+        pending_reqs = len([r for r in requests if r["status"] == "requested"])
+        _stat_cards([("Open RFPs", open_rfps),
+                     ("Bids due this week", due_week),
+                     ("Responses received", responses),
+                     ("Sub requests pending", pending_reqs)])
+    else:
+        invites = (sb().table("itb_invites").select("itb_id, status")
+                   .eq("sub_id", uid).execute().data)
+        my_reqs = (sb().table("bid_requests").select("id, status")
+                   .eq("sub_id", uid).execute().data)
+        active_ids = [v["itb_id"] for v in invites
+                      if v["status"] in ("sent", "responded")]
+        due_week = 0
+        if active_ids:
+            active_itbs = (sb().table("itbs").select("id, due_date")
+                           .in_("id", active_ids).execute().data)
+            due_week = len([i for i in active_itbs if i.get("due_date")
+                            and today <= date.fromisoformat(i["due_date"]) <= week_out])
+        accepted = len([r for r in my_reqs if r["status"] == "approved"])
+        awarded = len([v for v in invites if v["status"] == "awarded"])
+        pending = len([v for v in invites if v["status"] == "responded"])
+        not_sel = len([v for v in invites if v["status"] == "not_selected"])
+        _stat_cards([("Bids due this week", due_week),
+                     ("Requests accepted", accepted),
+                     ("Awarded", awarded),
+                     ("Pending decision", pending),
+                     ("Not selected", not_sel)])
+
+    st.markdown(f'<div class="f-mono" style="font-size:10px;'
+                f'color:{C["inkSoft"]};margin-bottom:10px">Activity summary is '
+                f'private to you — other contractors only see your portfolio '
+                f'below.</div>', unsafe_allow_html=True)
+
     st.markdown(
         f'<div class="card"><b>{profile["company"]}</b>{verified_badge(profile)}'
         f'<div class="f-mono" style="font-size:11px;color:{C["inkSoft"]}">'
@@ -1142,12 +1269,12 @@ with st.sidebar:
     st.markdown("<br>", unsafe_allow_html=True)
     if profile["role"] == "gc":
         page = st.radio("Navigate",
-                        ["Dashboard", "New Bid Request", "Bid Requests",
-                         "Sub Network", "My Profile", "Get Verified"],
+                        ["My Profile", "Dashboard", "New Bid Request",
+                         "Bid Requests", "Sub Network", "Get Verified"],
                         label_visibility="collapsed")
     else:
         page = st.radio("Navigate",
-                        ["Bid Invites", "RFP Board", "My Profile",
+                        ["My Profile", "Bid Invites", "RFP Board",
                          "Get Verified"],
                         label_visibility="collapsed")
     st.markdown("<br>", unsafe_allow_html=True)

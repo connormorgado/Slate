@@ -9,6 +9,7 @@
 create table if not exists profiles (
   id          uuid primary key references auth.users(id) on delete cascade,
   email       text not null,
+  contact_name text,
   role        text not null check (role in ('gc', 'sub')),
   company     text not null,
   trade       text,            -- subs only, e.g. 'Electrical (C-10)'
