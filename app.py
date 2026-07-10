@@ -1143,9 +1143,11 @@ def screen_my_profile(profile):
         pyear = c2.text_input("Year", key="np_year",
                               placeholder="2026 or 2024–2025")
         pdesc = st.text_area("Description (scope, size, role)", key="np_desc")
-        pphotos = st.file_uploader("Upload photos (JPG/PNG — select several "
-                                   "at once)", accept_multiple_files=True,
-                                   key="np_photos")
+        np_gen = st.session_state.get("photo_gen", 0)
+        pphotos = st.file_uploader("Upload photos (JPG/PNG/HEIC — select "
+                                   "several at once)",
+                                   accept_multiple_files=True,
+                                   key=f"np_photos_{np_gen}")
         if st.button("Add project"):
             if not title.strip():
                 st.error("Project title is required.")
@@ -1171,8 +1173,9 @@ def screen_my_profile(profile):
                     }).execute()
                 # clear the form so it's blank next time
                 for k in ("np_title", "np_loc", "np_year", "np_desc",
-                          "np_photos", "np_status"):
+                          "np_status"):
                     st.session_state.pop(k, None)
+                st.session_state.photo_gen = np_gen + 1  # clears the picker
                 st.success(f"Project added"
                            + (f" with {len(pphotos)} photo(s)." if pphotos
                               else "."))
@@ -1186,6 +1189,7 @@ def screen_my_profile(profile):
         return
 
     for p in projects:
+        editing = st.session_state.get("edit_project") == p["id"]
         with st.expander(f"{'🔨' if p['status'] == 'current' else '✅'} "
                          f"{p['title']} ({p['status']}"
                          f"{', ' + p['year'] if p.get('year') else ''})",
@@ -1195,6 +1199,25 @@ def screen_my_profile(profile):
                             f'</div>', unsafe_allow_html=True)
             photos = (sb().table("project_photos").select("*")
                       .eq("project_id", p["id"]).execute().data)
+
+            # ── published view (what visitors see) ──
+            if not editing:
+                if photos:
+                    cols = st.columns(3)
+                    for i, ph in enumerate(photos):
+                        url = signed_link(ph["path"])
+                        if url:
+                            cols[i % 3].image(url,
+                                              caption=ph.get("caption") or "")
+                if st.button("✏️ Edit project", key=f"edit_{p['id']}"):
+                    st.session_state.edit_project = p["id"]
+                    st.rerun()
+                continue
+
+            # ── edit mode (owner tools) ──
+            st.markdown(f'<div class="f-mono" style="font-size:10px;'
+                        f'color:{C["inkSoft"]}">EDITING — visitors never see '
+                        f'these controls</div>', unsafe_allow_html=True)
             if photos:
                 cols = st.columns(3)
                 for i, ph in enumerate(photos):
@@ -1206,27 +1229,39 @@ def screen_my_profile(profile):
                             "id", ph["id"]).execute()
                         st.rerun()
 
-            up = st.file_uploader("Add a photo (JPG/PNG)", key=f"up_{p['id']}")
-            cap = st.text_input("Photo caption", key=f"cap_{p['id']}",
-                                placeholder="e.g. Finished kitchen — custom cabinetry")
-            if st.button("Upload photo", key=f"addph_{p['id']}"):
-                if up is None:
-                    st.error("Choose a photo first.")
+            gen = st.session_state.get("photo_gen", 0)
+            ups = st.file_uploader(
+                "Add photos (JPG/PNG/HEIC — select several at once)",
+                accept_multiple_files=True, key=f"up_{p['id']}_{gen}")
+            cap = st.text_input(
+                "Caption (optional — applies to this batch)",
+                key=f"cap_{p['id']}_{gen}",
+                placeholder="e.g. Finished kitchen — custom cabinetry")
+            if st.button("Upload photos", key=f"addph_{p['id']}"):
+                if not ups:
+                    st.error("Choose at least one photo first.")
                 else:
-                    data, fname = photo_to_jpeg(up)
-                    path = (f"portfolio/{st.session_state.user_id}/{p['id']}/"
-                            f"{int(time.time())}_{fname}")
-                    mime = mimetypes.guess_type(fname)[0] or "image/jpeg"
-                    sb().storage.from_("drawings").upload(
-                        path, data, {"content-type": mime})
-                    sb().table("project_photos").insert({
-                        "project_id": p["id"], "path": path,
-                        "caption": cap.strip() or None,
-                    }).execute()
+                    for up in ups:
+                        data, fname = photo_to_jpeg(up)
+                        path = (f"portfolio/{st.session_state.user_id}/"
+                                f"{p['id']}/{int(time.time())}_{fname}")
+                        mime = mimetypes.guess_type(fname)[0] or "image/jpeg"
+                        sb().storage.from_("drawings").upload(
+                            path, data, {"content-type": mime})
+                        sb().table("project_photos").insert({
+                            "project_id": p["id"], "path": path,
+                            "caption": cap.strip() or None,
+                        }).execute()
+                    st.session_state.photo_gen = gen + 1  # clears the picker
                     st.rerun()
 
-            if st.button("Delete this project", key=f"delp_{p['id']}"):
+            b_done, b_del = st.columns(2)
+            if b_done.button("✓ Done editing", key=f"done_{p['id']}"):
+                st.session_state.pop("edit_project", None)
+                st.rerun()
+            if b_del.button("Delete this project", key=f"delp_{p['id']}"):
                 sb().table("projects").delete().eq("id", p["id"]).execute()
+                st.session_state.pop("edit_project", None)
                 st.rerun()
 
 
