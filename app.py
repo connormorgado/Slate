@@ -399,140 +399,9 @@ def handle_password_recovery():
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  SCREEN: PUBLIC LANDING PAGE  (what visitors see before logging in)
-# ─────────────────────────────────────────────────────────────────────
-def _land_card(title, body):
-    return (f'<div class="card reveal" style="min-height:120px"><b style="font-size:17px">'
-            f'{title}</b><div style="color:{C["inkSoft"]};font-size:15px;'
-            f'margin-top:6px">{body}</div></div>')
-
-
-def screen_landing():
-    # scroll-reveal styling (progressively enhanced — browsers without
-    # scroll-driven animation support just show content normally)
-    st.markdown('''<style>
-    @supports (animation-timeline: view()) {
-      .reveal { animation: slate-rise both;
-                animation-timeline: view();
-                animation-range: entry 0% entry 55%; }
-      @keyframes slate-rise {
-        from { opacity: 0; transform: translateY(26px); }
-        to   { opacity: 1; transform: none; }
-      }
-    }
-    @media (prefers-reduced-motion: reduce) { .reveal { animation: none; } }
-    </style>''', unsafe_allow_html=True)
-
-    # header row: brand left, both CTAs top right
-    h1, h2, h3 = st.columns([4, 1.6, 0.9])
-    with h1:
-        st.markdown('<div class="f-disp" style="font-size:22px;font-weight:700;'
-                    f'color:{C["ink"]};letter-spacing:2px;padding-top:6px">SLATE'
-                    '<span style="color:#1D7A44">.</span></div>',
-                    unsafe_allow_html=True)
-    with h2:
-        if st.button("Create your free account", key="cta_top"):
-            st.session_state.show_login = True
-            st.rerun()
-    with h3:
-        if st.button("LOG IN", key="land_login"):
-            st.session_state.show_login = True
-            st.rerun()
-    st.markdown(f'<div class="f-mono" style="font-size:11px;'
-                f'color:{C["inkSoft"]};text-align:right;margin-top:-6px">'
-                f'Free during the founding-member pilot · '
-                f'San Francisco Bay Area</div>', unsafe_allow_html=True)
-
-    # hero — dark panel with the glowing logo
-    st.markdown(
-        f'<div class="reveal" style="background:#0D0F0E;border-radius:10px;'
-        f'padding:48px 30px;text-align:center;margin:8px 0 20px 0">'
-        f'{logo_html(width=210)}'
-        f'<div class="f-disp" style="font-size:34px;font-weight:700;'
-        f'color:#FFFFFF;margin-top:18px;line-height:1.15">THE BID NETWORK '
-        f'BUILT BY CONTRACTORS,<br>FOR CONTRACTORS</div>'
-        f'<div style="color:#BFCCC2;font-size:17px;max-width:640px;'
-        f'margin:14px auto 0 auto">SLATE connects general contractors with '
-        f'CSLB-verified subcontractors — post bid requests, collect and level '
-        f'bids, and award scopes, all in one place.</div>'
-        f'</div>', unsafe_allow_html=True)
-
-    # for GCs / for Subs
-    st.markdown('<div class="eyebrow" style="margin-top:18px">WHAT SLATE '
-                'DOES</div>', unsafe_allow_html=True)
-    g1, g2 = st.columns(2)
-    with g1:
-        st.markdown(_land_card("For General Contractors",
-            "Post RFPs publicly, invite your trusted subs directly, or both. "
-            "Filter subcontractors by CSLB trade classification and work "
-            "location. Compare bids side by side — revisions tracked, low "
-            "bid flagged — and award with one click. Compliance documents "
-            "unlock automatically when you award."), unsafe_allow_html=True)
-    with g2:
-        st.markdown(_land_card("For Subcontractors",
-            "Browse open RFPs with scope, location, and schedule up front. "
-            "Request to bid on public work, respond to direct invites, and "
-            "showcase your projects with a photo portfolio. Every bid gets "
-            "an answer — awarded or not, you'll always hear back."),
-            unsafe_allow_html=True)
-
-    # trust / verification
-    st.markdown('<div class="eyebrow" style="margin-top:14px">A NETWORK YOU '
-                'CAN TRUST</div>', unsafe_allow_html=True)
-    t1, t2, t3 = st.columns(3)
-    t1.markdown(_land_card("✓ CSLB-Verified",
-        "Every contractor is checked against the California Contractors "
-        "State License Board before they can bid or post."),
-        unsafe_allow_html=True)
-    t2.markdown(_land_card("✓ Documents on File",
-        "Insurance, workers' comp, and licensing docs reviewed by SLATE. "
-        "Badges are public; documents stay private until award."),
-        unsafe_allow_html=True)
-    t3.markdown(_land_card("✓ Evidence of Excellence",
-        "Real project portfolios with photos — vet who you're working "
-        "with before the first phone call."), unsafe_allow_html=True)
-
-    # how it works
-    st.markdown('<div class="eyebrow" style="margin-top:14px">HOW IT WORKS'
-                '</div>', unsafe_allow_html=True)
-    steps = [("1 · CREATE AN ACCOUNT", "Sign up as a GC or a subcontractor "
-              "in under two minutes."),
-             ("2 · GET VERIFIED", "Enter your CSLB license — most "
-              "contractors are verified on the spot."),
-             ("3 · POST OR BID", "GCs post scopes with drawings; subs "
-              "respond with bids and documents."),
-             ("4 · AWARD & BUILD", "Award the scope, unlock compliance "
-              "docs, and get to work.")]
-    s1, s2, s3, s4 = st.columns(4)
-    for col, (t, b) in zip((s1, s2, s3, s4), steps):
-        col.markdown(_land_card(t, b), unsafe_allow_html=True)
-
-    # founder story + closing CTA
-    st.markdown(
-        f'<div class="reveal" style="background:#0D0F0E;border-radius:10px;'
-        f'padding:34px 30px;text-align:center;margin-top:20px">'
-        f'<div class="f-disp" style="font-size:24px;font-weight:700;'
-        f'color:#FFFFFF">NOT BUILT IN A TECH OFFICE.</div>'
-        f'<div style="color:#BFCCC2;font-size:16px;max-width:620px;'
-        f'margin:10px auto 0 auto">SLATE is built by working contractors who '
-        f'live the bid process every week — the missing subs, the unreturned '
-        f'calls, the paperwork chase. We build what the jobsite actually '
-        f'needs, and we ship improvements from user feedback in days, '
-        f'not quarters.</div></div>', unsafe_allow_html=True)
-
-    st.markdown(f'<div class="f-mono" style="font-size:10px;'
-                f'color:{C["inkSoft"]};text-align:center;margin-top:14px">'
-                f'BY CONTRACTORS, FOR CONTRACTORS · © 2026 SLATE</div>',
-                unsafe_allow_html=True)
-
-
-# ─────────────────────────────────────────────────────────────────────
 #  SCREEN: LOGIN / SIGN UP
 # ─────────────────────────────────────────────────────────────────────
 def screen_auth():
-    if st.button("← Back to homepage", key="auth_back"):
-        st.session_state.show_login = False
-        st.rerun()
     st.markdown(logo_html(width=190, boxed=True), unsafe_allow_html=True)
     st.markdown('<div class="eyebrow" style="margin-top:8px">BY CONTRACTORS, '
                 'FOR CONTRACTORS</div>', unsafe_allow_html=True)
@@ -2092,10 +1961,7 @@ if handle_password_recovery(): # reset-link flow owns the page when active
     st.stop()
 
 if "user_id" not in st.session_state:
-    if st.session_state.get("show_login"):
-        screen_auth()
-    else:
-        screen_landing()
+    screen_auth()
     st.stop()
 
 profile = st.session_state.get("profile") or load_profile()
