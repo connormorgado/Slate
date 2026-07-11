@@ -867,23 +867,47 @@ def screen_sub_inbox(profile):
 # ─────────────────────────────────────────────────────────────────────
 #  SHARED SCREEN: SUB NETWORK (GC view of registered subs)
 # ─────────────────────────────────────────────────────────────────────
-def screen_network():
-    heading("SUB NETWORK")
-    subs = (sb().table("profiles")
-            .select("id, company, trade, region, license_no, verification_status")
-            .eq("role", "sub").order("company").execute().data)
-    if not subs:
-        st.info("No subs registered yet.")
+def screen_directory(profile):
+    looking_for = "sub" if profile["role"] == "gc" else "gc"
+    heading("SUB NETWORK" if looking_for == "sub" else "FIND GCS")
+
+    q = st.text_input("Search", label_visibility="collapsed",
+                      placeholder="Search by company, trade, or region…")
+    rows = (sb().table("profiles")
+            .select("id, company, trade, region, license_no, "
+                    "verification_status")
+            .eq("role", looking_for).order("company").execute().data)
+    if q.strip():
+        needle = q.strip().lower()
+        rows = [r for r in rows if needle in " ".join(
+            filter(None, [r.get("company"), r.get("trade"),
+                          r.get("region")])).lower()]
+
+    if not rows:
+        st.info("No matches — try a broader search term."
+                if q.strip() else
+                ("No subs registered yet." if looking_for == "sub"
+                 else "No GCs registered yet."))
         return
-    for s in subs:
+
+    st.markdown(f'<div class="f-mono" style="font-size:11px;'
+                f'color:{C["inkSoft"]};margin-bottom:6px">'
+                f'{len(rows)} result{"s" if len(rows) != 1 else ""}</div>',
+                unsafe_allow_html=True)
+
+    for s in rows:
         badge = verified_badge(s)
         extra = ("" if s.get("verification_status") == "verified" else
                  f' <span class="f-mono" style="color:{C["inkSoft"]};'
-                 f'font-size:11px">NOT YET VERIFIED — can\'t be invited</span>')
+                 f'font-size:11px">NOT YET VERIFIED'
+                 + (" — can't be invited" if looking_for == "sub" else "")
+                 + '</span>')
+        role_line = (s.get("trade") or "trade not set"
+                     if looking_for == "sub" else "General Contractor")
         st.markdown(
             f'<div class="card"><b>{s["company"]}</b>{badge}{extra}'
             f'<div class="f-mono" style="font-size:11px;color:{C["inkSoft"]}">'
-            f'{s.get("trade") or "trade not set"} · {s.get("region") or ""} · '
+            f'{role_line} · {s.get("region") or ""} · '
             f'CSLB {s.get("license_no") or "—"}</div></div>',
             unsafe_allow_html=True)
         if st.button("View profile", key=f"netprof_{s['id']}"):
@@ -939,6 +963,12 @@ def screen_rfp_board(profile):
         gc_name = gc_names.get(r["gc_id"], "GC")
         with st.expander(f"{r['project']} — {r['trade']} · {gc_name} "
                          f"(bids due {r['due_date']})"):
+            st.markdown('<div class="eyebrow">POSTED BY</div>',
+                        unsafe_allow_html=True)
+            if st.button(f"🏗 {gc_name}", key=f"gcprof_{r['id']}",
+                         help="View this GC's profile and portfolio"):
+                st.session_state.view_profile = r["gc_id"]
+                st.rerun()
             meta = (f'📍 {r.get("location") or "location TBD"} · '
                     f'🗓 {r.get("start_date") or "TBD"} → {r.get("end_date") or "TBD"}')
             if r.get("budget_note"):
@@ -954,9 +984,6 @@ def screen_rfp_board(profile):
                         f'color:{C["inkSoft"]};margin-top:6px">Drawings & specs '
                         f'unlock once you\'re approved to bid.</div>',
                         unsafe_allow_html=True)
-            if st.button(f"View {gc_name}'s profile", key=f"gcprof_{r['id']}"):
-                st.session_state.view_profile = r["gc_id"]
-                st.rerun()
 
             # this sub's standing on this RFP
             if r["id"] in my_invites:
@@ -1395,7 +1422,8 @@ with st.sidebar:
     nav_items = (["My Profile", "Dashboard", "New Bid Request",
                   "Bid Requests", "Sub Network", "Get Verified"]
                  if profile["role"] == "gc" else
-                 ["My Profile", "Bid Invites", "RFP Board", "Get Verified"])
+                 ["My Profile", "Bid Invites", "RFP Board", "Find GCs",
+                  "Get Verified"])
     if st.session_state.get("page") not in nav_items:
         st.session_state.page = nav_items[0]
     for item in nav_items:
@@ -1426,9 +1454,11 @@ elif profile["role"] == "gc":
     elif page == "Bid Requests":
         screen_gc_requests(profile)
     else:
-        screen_network()
+        screen_directory(profile)
 else:
     if page == "RFP Board":
         screen_rfp_board(profile)
+    elif page == "Find GCs":
+        screen_directory(profile)
     else:
         screen_sub_inbox(profile)
