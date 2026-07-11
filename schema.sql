@@ -10,9 +10,12 @@ create table if not exists profiles (
   id          uuid primary key references auth.users(id) on delete cascade,
   email       text not null,
   contact_name text,
-  role        text not null check (role in ('gc', 'sub')),
+  role        text not null check (role in ('gc', 'sub', 'admin')),
   company     text not null,
-  trade       text,            -- subs only, e.g. 'Electrical (C-10)'
+  trade       text,
+  trades      text[],          -- CSLB classes
+  work_states text[],
+  work_cities text,
   region      text,
   license_no  text,            -- CSLB license number
   verification_status text not null default 'unverified'
@@ -38,6 +41,9 @@ create table if not exists itbs (
   start_date  date,
   end_date    date,
   budget_note text,
+  state       text,
+  city        text,
+  trades      text[],
   created_at  timestamptz default now()
 );
 
@@ -285,3 +291,116 @@ create policy "delete photos on own projects"
   using (exists (select 1 from projects p
                  where p.id = project_photos.project_id
                  and p.owner_id = auth.uid()));
+
+
+-- ═══ from migration_007.sql ═══
+-- ═══════════════════════════════════════════════════════════════════
+
+-- ── allow the admin role ────────────────────────────────────────────
+alter table profiles drop constraint if exists profiles_role_check;
+alter table profiles add constraint profiles_role_check
+  check (role in ('gc', 'sub', 'admin'));
+
+-- ── is_admin(): security definer so policies can check the caller's
+create or replace function public.is_admin()
+returns boolean
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select exists (select 1 from profiles
+                 where id = auth.uid() and role = 'admin');
+$$;
+
+-- ── admin reads everything ──────────────────────────────────────────
+create policy "admin reads itbs"        on itbs        for select to authenticated using (public.is_admin());
+create policy "admin reads itb_files"   on itb_files   for select to authenticated using (public.is_admin());
+create policy "admin reads invites"     on itb_invites for select to authenticated using (public.is_admin());
+create policy "admin reads bids"        on bids        for select to authenticated using (public.is_admin());
+create policy "admin reads bid_files"   on bid_files   for select to authenticated using (public.is_admin());
+create policy "admin reads requests"    on bid_requests for select to authenticated using (public.is_admin());
+-- (profiles, projects, project_photos are already readable by all
+
+-- admin can update verification status on any profile (approve/reject)
+create policy "admin updates profiles"
+  on profiles for update to authenticated using (public.is_admin());
+
+-- ── feedback ────────────────────────────────────────────────────────
+create table if not exists feedback (
+  id          bigint generated always as identity primary key,
+  user_id     uuid not null references profiles(id) on delete cascade,
+  message     text not null,
+  status      text not null default 'open'
+      check (status in ('open', 'resolved')),
+  created_at  timestamptz default now()
+);
+
+alter table feedback enable row level security;
+
+create policy "users submit own feedback"
+  on feedback for insert to authenticated with check (user_id = auth.uid());
+create policy "read own feedback or admin reads all"
+  on feedback for select to authenticated
+  using (user_id = auth.uid() or public.is_admin());
+create policy "admin resolves feedback"
+  on feedback for update to authenticated using (public.is_admin());
+
+
+-- ═══ from migration_008.sql ═══
+--
+-- ═══════════════════════════════════════════════════════════════════
+
+create table if not exists verification_docs (
+  id          bigint generated always as identity primary key,
+  user_id     uuid not null references profiles(id) on delete cascade,
+  doc_type    text not null,
+  path        text not null,     -- storage path inside the 'docs' bucket
+  filename    text not null,
+  status      text not null default 'pending'
+      check (status in ('pending', 'approved', 'rejected')),
+  note        text,              -- admin note on rejection
+  created_at  timestamptz default now(),
+  reviewed_at timestamptz
+);
+
+alter table verification_docs enable row level security;
+
+-- owner + admin always; GC only via an awarded invite linking them
+create policy "docs readable by owner, admin, or awarding gc"
+  on verification_docs for select to authenticated
+  using (user_id = auth.uid()
+         or public.is_admin()
+         or exists (select 1 from itb_invites v
+                    join itbs i on i.id = v.itb_id
+                    where v.status = 'awarded'
+                    and v.sub_id = verification_docs.user_id
+                    and i.gc_id = auth.uid()));
+
+create policy "owner submits own docs"
+  on verification_docs for insert to authenticated
+  with check (user_id = auth.uid());
+
+create policy "admin reviews docs"
+  on verification_docs for update to authenticated using (public.is_admin());
+
+-- ── private storage bucket, path convention: {user_id}/{filename} ──
+insert into storage.buckets (id, name, public)
+values ('docs', 'docs', false)
+on conflict (id) do nothing;
+
+create policy "owner uploads own docs"
+  on storage.objects for insert to authenticated
+  with check (bucket_id = 'docs'
+              and (storage.foldername(name))[1] = auth.uid()::text);
+
+create policy "docs readable by owner, admin, or awarding gc (storage)"
+  on storage.objects for select to authenticated
+  using (bucket_id = 'docs'
+         and ((storage.foldername(name))[1] = auth.uid()::text
+              or public.is_admin()
+              or exists (select 1 from itb_invites v
+                         join itbs i on i.id = v.itb_id
+                         where v.status = 'awarded'
+                         and i.gc_id = auth.uid()
+                         and v.sub_id::text = (storage.foldername(name))[1])));

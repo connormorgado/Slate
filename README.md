@@ -146,3 +146,44 @@ View anyone's profile from the RFP board, Sub Network, or Bid Requests.
 5. Sub: My Profile -> add a project + photo with caption
 6. GC: Sub Network -> View profile -> see the project and photo
 7. Unverified account: can browse RFP Board, gets verify prompt on request
+
+## Migrations 007–009 — admin, feedback, docs, session, recovery, matching
+
+Run in order in the SQL Editor: `migration_007.sql`, `migration_008.sql`,
+`migration_009.sql`. Then two one-time setup steps:
+
+**1. Make yourself admin:** Table Editor -> profiles -> your row ->
+role = `admin`. You'll get the admin nav on next login: platform stats,
+all users, all RFPs & bids, the Verification Queue (license + document
+review), and the Feedback Inbox.
+
+**2. Password recovery email template:** Supabase -> Authentication ->
+Email Templates -> Reset Password. Replace the link/href with:
+`{{ .SiteURL }}/?token_hash={{ .TokenHash }}&type=recovery`
+And set Authentication -> URL Configuration -> Site URL to your app URL
+(e.g. https://slate-bids.streamlit.app). Without this, reset links won't
+land back in SLATE correctly.
+
+**What shipped:**
+
+- **Admin role** — full read access everywhere (database-enforced),
+  verification approvals in-app (no more Table Editor), doc review with
+  approve/reject + rejection notes, feedback inbox with resolve.
+- **Feedback** — a "Send feedback" box in every user's sidebar; lands in
+  the admin Feedback Inbox.
+- **Session persistence** — refresh no longer logs you out (30-day
+  browser cookie holding a rotating refresh token). Note: the first page
+  load may briefly flash the login screen while the cookie is read.
+- **Password recovery** — "Forgot your password?" on the login screen.
+- **Document verification** — subs and GCs upload COI, license certs,
+  workers' comp, business license under Get Verified. Admin reviews.
+  Profiles show ✓ badges only; the actual files unlock to a GC ONLY
+  after awarding that sub — enforced by database policy, not just UI.
+- **Location + trade matching** — subs declare CSLB-class trades and
+  work states/cities (onboarding + My Profile -> Trades & service area).
+  RFPs now specify work state/city and needed trades (multi-select);
+  the sub picker filters to matching subs. Subs without trades/areas set
+  appear in a separate "not yet specified" group until they update.
+
+**Existing testers must update their profiles** (My Profile -> Trades &
+service area) or they'll fall into the unspecified group on new RFPs.

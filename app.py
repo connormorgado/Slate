@@ -50,6 +50,40 @@ except Exception:
 
 from cslb import check_license
 
+try:
+    from streamlit_cookies_controller import CookieController
+except Exception:
+    CookieController = None
+
+# CSLB contractor classifications (common set — extend anytime)
+TRADES = [
+    "A - General Engineering", "B - General Building",
+    "C-2 Insulation", "C-4 Boiler", "C-5 Framing",
+    "C-6 Cabinet & Millwork", "C-7 Low Voltage", "C-8 Concrete",
+    "C-9 Drywall", "C-10 Electrical", "C-11 Elevator",
+    "C-12 Earthwork & Paving", "C-13 Fencing", "C-15 Flooring & Floor Covering",
+    "C-16 Fire Protection", "C-17 Glazing", "C-20 HVAC",
+    "C-21 Building Moving & Demolition", "C-23 Ornamental Metal",
+    "C-27 Landscaping", "C-28 Lock & Security", "C-29 Masonry",
+    "C-33 Painting & Decorating", "C-34 Pipeline", "C-35 Plastering",
+    "C-36 Plumbing", "C-38 Refrigeration", "C-39 Roofing",
+    "C-42 Sanitation", "C-43 Sheet Metal", "C-45 Signs", "C-46 Solar",
+    "C-50 Reinforcing Steel", "C-51 Structural Steel",
+    "C-53 Swimming Pool", "C-54 Ceramic & Mosaic Tile",
+    "C-57 Well Drilling", "C-60 Welding", "C-61 Limited Specialty",
+]
+
+US_STATES = ["AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID",
+             "IL","IN","IA","KS","KY","LA","ME","MD","MA","MI","MN","MS",
+             "MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK",
+             "OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV",
+             "WI","WY"]
+
+DOC_TYPES = ["Certificate of Insurance (COI)",
+             "Contractor License Certificate",
+             "Workers' Comp Certificate",
+             "Business License"]
+
 
 def photo_to_jpeg(uploaded, max_px=1600):
     """Convert any uploaded photo (including iPhone HEIC) to a
@@ -185,11 +219,64 @@ def require_secrets():
         st.stop()
 
 
+def _get_cookies():
+    if CookieController is None:
+        return None
+    if "_cookie_ctl" not in st.session_state:
+        st.session_state._cookie_ctl = CookieController()
+    return st.session_state._cookie_ctl
+
+
+def _save_session_cookie(session):
+    """Persist the refresh token so a page refresh doesn't log you out."""
+    ctl = _get_cookies()
+    if ctl and session and getattr(session, "refresh_token", None):
+        try:
+            ctl.set("slate_rt", session.refresh_token,
+                    max_age=60 * 60 * 24 * 30)
+        except Exception:
+            pass
+
+
+def _clear_session_cookie():
+    ctl = _get_cookies()
+    if ctl:
+        try:
+            ctl.remove("slate_rt")
+        except Exception:
+            pass
+
+
+def try_restore_session():
+    """On page load, quietly log back in from the browser cookie."""
+    if "user_id" in st.session_state:
+        return
+    ctl = _get_cookies()
+    if ctl is None:
+        return
+    try:
+        rt = ctl.get("slate_rt")
+    except Exception:
+        return
+    if not rt:
+        return
+    try:
+        res = get_client().auth.refresh_session(rt)
+        if res and res.session:
+            st.session_state.access_token = res.session.access_token
+            st.session_state.user_id = res.user.id
+            st.session_state.user_email = res.user.email
+            _save_session_cookie(res.session)   # tokens rotate — save the new one
+    except Exception:
+        _clear_session_cookie()
+
+
 def sign_in(email, password):
     res = get_client().auth.sign_in_with_password({"email": email, "password": password})
     st.session_state.access_token = res.session.access_token
     st.session_state.user_id = res.user.id
     st.session_state.user_email = res.user.email
+    _save_session_cookie(res.session)
 
 
 def sign_up(email, password):
@@ -203,10 +290,16 @@ def sign_up(email, password):
     st.session_state.access_token = res.session.access_token
     st.session_state.user_id = res.user.id
     st.session_state.user_email = res.user.email
+    _save_session_cookie(res.session)
 
 
 def sign_out():
-    for k in ("access_token", "user_id", "user_email", "profile"):
+    _clear_session_cookie()
+    try:
+        get_client().auth.sign_out()
+    except Exception:
+        pass
+    for k in ("access_token", "user_id", "user_email", "profile", "page"):
         st.session_state.pop(k, None)
 
 
@@ -265,6 +358,54 @@ def send_simple_email(to_email, subject, html):
         return False
 
 
+def handle_password_recovery():
+    """Handles the reset link from the Supabase email. Returns True while
+    the recovery flow owns the page. Requires the Reset Password email
+    template in Supabase to link to:
+    {{ .SiteURL }}/?token_hash={{ .TokenHash }}&type=recovery
+    (see README)."""
+    qp = st.query_params
+    if qp.get("type") != "recovery" or not qp.get("token_hash"):
+        return False
+
+    if "recovery_verified" not in st.session_state:
+        try:
+            res = get_client().auth.verify_otp(
+                {"token_hash": qp["token_hash"], "type": "recovery"})
+            st.session_state.access_token = res.session.access_token
+            st.session_state.user_id = res.user.id
+            st.session_state.user_email = res.user.email
+            st.session_state.recovery_verified = True
+        except Exception:
+            st.error("This reset link is invalid or has expired — request "
+                     "a fresh one from the login page.")
+            if st.button("Back to login"):
+                st.query_params.clear()
+                st.rerun()
+            return True
+
+    st.markdown(logo_html(width=190, boxed=True), unsafe_allow_html=True)
+    heading("SET A NEW PASSWORD")
+    pw1 = st.text_input("New password (8+ characters)", type="password")
+    pw2 = st.text_input("Confirm new password", type="password")
+    if st.button("Update password"):
+        if len(pw1) < 8:
+            st.error("Password needs at least 8 characters.")
+        elif pw1 != pw2:
+            st.error("Passwords don't match.")
+        else:
+            try:
+                get_client().auth.update_user({"password": pw1})
+                st.query_params.clear()
+                st.session_state.pop("recovery_verified", None)
+                st.success("Password updated — you're logged in.")
+                time.sleep(1.2)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Couldn't update the password: {e}")
+    return True
+
+
 # ─────────────────────────────────────────────────────────────────────
 #  SCREEN: LOGIN / SIGN UP
 # ─────────────────────────────────────────────────────────────────────
@@ -284,6 +425,22 @@ def screen_auth():
                 st.rerun()
             except Exception:
                 st.error("Login failed — check your email and password.")
+        with st.expander("Forgot your password?"):
+            r_email = st.text_input("Account email", key="reset_email")
+            if st.button("Send reset link"):
+                if not r_email.strip():
+                    st.error("Enter your account email.")
+                else:
+                    try:
+                        get_client().auth.reset_password_for_email(
+                            r_email.strip(),
+                            {"redirect_to": st.secrets.get("APP_URL", "")})
+                        st.success("Reset link sent — check your email. "
+                                   "The link brings you back here to set a "
+                                   "new password.")
+                    except Exception:
+                        st.success("If that email has an account, a reset "
+                                   "link is on its way.")
     with tab_up:
         email = st.text_input("Email", key="su_email")
         pw = st.text_input("Password (8+ characters)", type="password", key="su_pw")
@@ -306,10 +463,15 @@ def screen_onboarding():
     contact = st.text_input("Your name", placeholder="First and last")
     role = st.radio("I am a…", ["General Contractor", "Subcontractor"], horizontal=True)
     company = st.text_input("Company name")
-    trade, license_no = None, None
+    trade, license_no, trades_sel, states_sel, cities = None, None, [], [], ""
     if role == "Subcontractor":
-        trade = st.text_input("Trade + license class (e.g. Electrical C-10)")
+        trades_sel = st.multiselect("Trades (CSLB classifications)", TRADES)
         license_no = st.text_input("CSLB license #")
+        states_sel = st.multiselect("States you work in", US_STATES,
+                                    default=["CA"])
+        cities = st.text_input("Cities / areas you serve",
+                               placeholder="e.g. San Jose, Santa Clara, Gilroy")
+        trade = ", ".join(trades_sel) if trades_sel else None
     region = st.text_input("Region (e.g. South Bay)")
     if st.button("Save profile"):
         if not company.strip():
@@ -322,6 +484,9 @@ def screen_onboarding():
             "company": company.strip(),
             "contact_name": contact.strip() or None,
             "trade": (trade or "").strip() or None,
+            "trades": trades_sel or None,
+            "work_states": states_sel or None,
+            "work_cities": cities.strip() or None,
             "license_no": (license_no or "").strip() or None,
             "region": region.strip() or None,
         }).execute()
@@ -435,6 +600,66 @@ def apply_verification(result, license_no, profile):
     return update["verification_status"]
 
 
+def doc_status_summary(uid):
+    """Approved-doc badges for public display — names only, never files."""
+    docs = (sb().table("verification_docs").select("doc_type, status")
+            .eq("user_id", uid).execute().data)
+    latest = {}
+    for d in docs:
+        latest[d["doc_type"]] = d["status"]   # rows come oldest-first; last wins
+    approved = [t for t, s in latest.items() if s == "approved"]
+    return approved, len(DOC_TYPES)
+
+
+def render_docs_section(profile):
+    """Document verification — shown on Get Verified for both roles."""
+    st.markdown('<div class="eyebrow" style="margin-top:14px">'
+                'VERIFICATION DOCUMENTS</div>', unsafe_allow_html=True)
+    st.markdown(f'<div style="color:{C["inkSoft"]};font-size:14px;'
+                f'margin-bottom:6px">Upload your compliance documents. '
+                f'SLATE reviews each one; other contractors see only '
+                f'completion badges — never the documents themselves. A GC '
+                f'gains access to a sub\'s documents only after awarding '
+                f'them a scope.</div>', unsafe_allow_html=True)
+
+    docs = (sb().table("verification_docs").select("*")
+            .eq("user_id", st.session_state.user_id)
+            .order("created_at").execute().data)
+    latest = {}
+    for d in docs:
+        latest[d["doc_type"]] = d
+
+    ICONS = {"approved": "✅", "pending": "⏳", "rejected": "❌"}
+    gen = st.session_state.get("doc_gen", 0)
+    for i, dt in enumerate(DOC_TYPES):
+        cur = latest.get(dt)
+        badge = (f'{ICONS[cur["status"]]} {cur["status"].upper()}'
+                 if cur else "— not submitted")
+        note = (f' · {cur["note"]}' if cur and cur.get("note")
+                and cur["status"] == "rejected" else "")
+        st.markdown(f'<div class="card"><b>{dt}</b> '
+                    f'<span class="f-mono" style="font-size:11px;'
+                    f'color:{C["inkSoft"]}">{badge}{note}</span></div>',
+                    unsafe_allow_html=True)
+        if not cur or cur["status"] == "rejected":
+            up = st.file_uploader("Upload (PDF/JPG/PNG)",
+                                  key=f"doc_{i}_{gen}",
+                                  label_visibility="collapsed")
+            if up is not None and st.button(f"Submit {dt.split(' (')[0]}",
+                                            key=f"docbtn_{i}"):
+                path = (f"{st.session_state.user_id}/"
+                        f"{int(time.time())}_{up.name}")
+                mime = mimetypes.guess_type(up.name)[0] or "application/pdf"
+                sb().storage.from_("docs").upload(
+                    path, up.getvalue(), {"content-type": mime})
+                sb().table("verification_docs").insert({
+                    "user_id": st.session_state.user_id,
+                    "doc_type": dt, "path": path, "filename": up.name,
+                }).execute()
+                st.session_state.doc_gen = gen + 1
+                st.rerun()
+
+
 # ─────────────────────────────────────────────────────────────────────
 #  SCREEN: GET VERIFIED
 # ─────────────────────────────────────────────────────────────────────
@@ -453,6 +678,7 @@ def screen_verify(profile):
             f'Status: {profile.get("cslb_status") or "—"}<br>'
             f'Expires: {profile.get("cslb_expires") or "—"}</div></div>',
             unsafe_allow_html=True)
+        render_docs_section(profile)
         return
 
     if vs == "pending":
@@ -501,6 +727,7 @@ def screen_verify(profile):
                        if result.get("business") else "")
                     + ". It didn't auto-match cleanly, so it's been queued for "
                     "manual review. You'll be unlocked once approved.")
+    render_docs_section(profile)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -514,7 +741,8 @@ def screen_new_itb(profile):
         return
 
     subs = (sb().table("profiles")
-            .select("id, company, trade, region, email")
+            .select("id, company, trade, region, email, trades, work_states, "
+                    "work_cities")
             .eq("role", "sub")
             .eq("verification_status", "verified").execute().data)
 
@@ -531,9 +759,15 @@ def screen_new_itb(profile):
                   "Both — post publicly AND invite specific subs": "both"}[vis_label]
 
     project = st.text_input("Project", placeholder="Lariat Ln Residence — 3,750 SF New Build")
-    trade = st.text_input("Trade package", placeholder="Framing Package")
+    trades_needed = st.multiselect("Trades needed (CSLB classifications — "
+                                   "select all that apply)", TRADES)
+    trade = ", ".join(trades_needed)
     scope = st.text_area("Scope of work")
-    location = st.text_input("Location", placeholder="San Jose, CA (East Foothills)")
+    lc1, lc2 = st.columns([1, 2])
+    r_state = lc1.selectbox("Work state", US_STATES,
+                            index=US_STATES.index("CA"))
+    r_city = lc2.text_input("Work city", placeholder="San Jose")
+    location = f"{r_city.strip()}, {r_state}" if r_city.strip() else r_state
     c1, c2, c3 = st.columns(3)
     start = c1.date_input("Expected start")
     end = c2.date_input("Expected end")
@@ -547,17 +781,42 @@ def screen_new_itb(profile):
     if visibility in ("invite", "both"):
         st.markdown('<div class="eyebrow" style="margin-top:8px">SELECT SUBS '
                     'TO INVITE DIRECTLY</div>', unsafe_allow_html=True)
-        if not subs:
-            st.info("No verified subs to invite yet — they appear here once "
-                    "they complete CSLB verification.")
+        matched, unspecified = [], []
         for s in subs:
-            label = f"{s['company']} — {s.get('trade') or 'trade not set'} · {s.get('region') or ''}"
+            trade_ok = (not trades_needed
+                        or (s.get("trades")
+                            and set(trades_needed) & set(s["trades"])))
+            state_ok = (not s.get("work_states")
+                        or r_state in s["work_states"])
+            has_info = bool(s.get("trades")) and bool(s.get("work_states"))
+            if trade_ok and state_ok:
+                (matched if has_info else unspecified).append(s)
+        st.markdown(f'<div class="f-mono" style="font-size:11px;'
+                    f'color:{C["inkSoft"]}">Filtered to subs matching the '
+                    f'selected trades and working in {r_state}. '
+                    f'{len(subs) - len(matched) - len(unspecified)} sub(s) '
+                    f'filtered out.</div>', unsafe_allow_html=True)
+        if not matched and not unspecified:
+            st.info("No verified subs match this trade + location yet.")
+        for s in matched:
+            label = (f"{s['company']} — "
+                     f"{', '.join(s.get('trades') or [])} · "
+                     f"{s.get('work_cities') or s.get('region') or ''}")
             if st.checkbox(label, key=f"sub_{s['id']}"):
                 picked.append(s)
+        if unspecified:
+            with st.expander(f"{len(unspecified)} sub(s) with trades/service "
+                             f"area not yet specified"):
+                for s in unspecified:
+                    label = (f"{s['company']} — "
+                             f"{s.get('trade') or 'trade not set'} · "
+                             f"{s.get('region') or ''}")
+                    if st.checkbox(label, key=f"sub_{s['id']}"):
+                        picked.append(s)
 
     if st.button("Post Bid Request"):
-        if not (project.strip() and trade.strip()):
-            st.error("Project and trade package are required.")
+        if not (project.strip() and trades_needed):
+            st.error("Project and at least one trade are required.")
             return
         if visibility == "invite" and not picked:
             st.error("Invite-only bid requests need at least one sub selected "
@@ -574,6 +833,9 @@ def screen_new_itb(profile):
                 "due_date": due.isoformat(),
                 "visibility": visibility,
                 "location": location.strip() or None,
+                "state": r_state,
+                "city": r_city.strip() or None,
+                "trades": trades_needed,
                 "start_date": start.isoformat(),
                 "end_date": end.isoformat(),
                 "budget_note": budget_note.strip() or None,
@@ -718,6 +980,25 @@ def screen_gc_dashboard(profile):
                     st.markdown(f"- 📎 [{f['filename']}]({url})" if url
                                 else f"- 📎 {f['filename']} (link unavailable)")
 
+                if invite and invite["status"] == "awarded":
+                    vdocs = (sb().table("verification_docs")
+                             .select("doc_type, path, filename")
+                             .eq("user_id", b["sub_id"])
+                             .eq("status", "approved").execute().data)
+                    if vdocs:
+                        st.markdown('<div class="eyebrow">VERIFIED DOCUMENTS '
+                                    '(unlocked by award)</div>',
+                                    unsafe_allow_html=True)
+                        for vd in vdocs:
+                            try:
+                                sg = sb().storage.from_("docs").create_signed_url(
+                                    vd["path"], 3600)
+                                u = sg.get("signedURL") or sg.get("signed_url")
+                                st.markdown(f"- 🔓 [{vd['doc_type']} — "
+                                            f"{vd['filename']}]({u})")
+                            except Exception:
+                                st.markdown(f"- 🔓 {vd['doc_type']} — "
+                                            f"{vd['filename']} (link unavailable)")
                 if not awarded and invite:
                     if st.button(f"Award to {sub_name}",
                                  key=f"award_{itb['id']}_{b['sub_id']}"):
@@ -971,6 +1252,8 @@ def screen_rfp_board(profile):
                 st.rerun()
             meta = (f'📍 {r.get("location") or "location TBD"} · '
                     f'🗓 {r.get("start_date") or "TBD"} → {r.get("end_date") or "TBD"}')
+            if r.get("trades"):
+                meta += f' · 🛠 {", ".join(r["trades"])}'
             if r.get("budget_note"):
                 meta += f' · 💲 {r["budget_note"]}'
             st.markdown(
@@ -1202,6 +1485,32 @@ def screen_my_profile(profile):
         f'{"GC" if profile["role"] == "gc" else profile.get("trade") or "Sub"} · '
         f'{profile.get("region") or ""} · CSLB {profile.get("license_no") or "—"}'
         f'</div></div>', unsafe_allow_html=True)
+    if profile["role"] == "sub":
+        with st.expander("🛠 Trades & service area"):
+            cur_trades = [t for t in (profile.get("trades") or [])
+                          if t in TRADES]
+            cur_states = [x for x in (profile.get("work_states") or [])
+                          if x in US_STATES]
+            new_trades = st.multiselect("Trades (CSLB classifications)",
+                                        TRADES, default=cur_trades)
+            new_states = st.multiselect("States you work in", US_STATES,
+                                        default=cur_states or ["CA"])
+            new_cities = st.text_input(
+                "Cities / areas you serve",
+                value=profile.get("work_cities") or "",
+                placeholder="e.g. San Jose, Santa Clara, Gilroy")
+            if st.button("Save trades & service area"):
+                upd = {"trades": new_trades or None,
+                       "work_states": new_states or None,
+                       "work_cities": new_cities.strip() or None,
+                       "trade": ", ".join(new_trades) or None}
+                sb().table("profiles").update(upd).eq(
+                    "id", st.session_state.user_id).execute()
+                st.session_state.profile = {**profile, **upd}
+                st.success("Saved — GCs filtering by trade and location "
+                           "will now find you.")
+                st.rerun()
+
     st.markdown(f'<div style="color:{C["inkSoft"]};margin-bottom:6px">Your '
                 f'portfolio is your evidence of excellence — every GC and sub '
                 f'on SLATE can see it. Add current and completed projects with '
@@ -1367,6 +1676,18 @@ def screen_public_profile(uid):
         + (f' · expires {p["cslb_expires"]}' if p.get("cslb_expires") else "")
         + '</div></div>', unsafe_allow_html=True)
 
+    approved_docs, total_docs = doc_status_summary(uid)
+    if approved_docs:
+        chips = " · ".join(f"✅ {d.split(' (')[0]}" for d in approved_docs)
+        st.markdown(f'<div class="card"><div class="eyebrow">SLATE-VERIFIED '
+                    f'DOCUMENTS ({len(approved_docs)}/{total_docs})</div>'
+                    f'<div class="f-mono" style="font-size:12px;'
+                    f'color:{C["green"]}">{chips}</div>'
+                    f'<div class="f-mono" style="font-size:10px;'
+                    f'color:{C["inkSoft"]}">Documents verified by SLATE — '
+                    f'files release to the GC upon award.</div></div>',
+                    unsafe_allow_html=True)
+
     projects = (sb().table("projects").select("*").eq("owner_id", uid)
                 .order("created_at", desc=True).execute().data)
     if not projects:
@@ -1398,9 +1719,253 @@ def screen_public_profile(uid):
 
 
 # ─────────────────────────────────────────────────────────────────────
+#  FEEDBACK WIDGET  (sidebar, all users) — lands in the admin inbox
+# ─────────────────────────────────────────────────────────────────────
+def feedback_widget():
+    with st.expander("💬 Send feedback"):
+        gen = st.session_state.get("fb_gen", 0)
+        msg = st.text_area("What's working? What's broken? What's missing?",
+                           key=f"fb_msg_{gen}", label_visibility="collapsed",
+                           placeholder="What's working? What's broken? "
+                                       "What's missing?")
+        if st.button("Send to SLATE", key="fb_send"):
+            if not msg.strip():
+                st.error("Write something first.")
+            else:
+                sb().table("feedback").insert({
+                    "user_id": st.session_state.user_id,
+                    "message": msg.strip(),
+                }).execute()
+                st.session_state.fb_gen = gen + 1
+                st.success("Sent — thank you. Every message gets read.")
+                st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  ADMIN SCREENS
+# ─────────────────────────────────────────────────────────────────────
+def screen_admin_home(profile):
+    heading("SLATE ADMIN")
+    profiles_all = (sb().table("profiles")
+                    .select("id, role, verification_status").execute().data)
+    itbs_all = sb().table("itbs").select("id").execute().data
+    bids_all = (sb().table("bids").select("itb_id, sub_id, amount, revision")
+                .execute().data)
+    fb_open = (sb().table("feedback").select("id")
+               .eq("status", "open").execute().data)
+    docs_pending = (sb().table("verification_docs").select("id")
+                    .eq("status", "pending").execute().data)
+    ver_pending = [p for p in profiles_all
+                   if p["verification_status"] == "pending"]
+    latest = {}
+    for b in bids_all:
+        k = (b["itb_id"], b["sub_id"])
+        if k not in latest or b["revision"] > latest[k]["revision"]:
+            latest[k] = b
+    bid_vol = sum(b["amount"] for b in latest.values())
+    _stat_cards([("GCs", sum(1 for p in profiles_all if p["role"] == "gc")),
+                 ("Subs", sum(1 for p in profiles_all if p["role"] == "sub")),
+                 ("RFPs posted", len(itbs_all)),
+                 ("Bid volume", f"${bid_vol:,.0f}")])
+    _stat_cards([("Verified users",
+                  sum(1 for p in profiles_all
+                      if p["verification_status"] == "verified")),
+                 ("Pending verifications", len(ver_pending)),
+                 ("Docs awaiting review", len(docs_pending)),
+                 ("Open feedback", len(fb_open))])
+    st.markdown(f'<div class="f-mono" style="font-size:11px;'
+                f'color:{C["inkSoft"]}">Pending items live in the '
+                f'Verification Queue and Feedback Inbox.</div>',
+                unsafe_allow_html=True)
+
+
+def screen_admin_users():
+    heading("ALL USERS")
+    q = st.text_input("Search users", label_visibility="collapsed",
+                      placeholder="Search company, trade, or region…")
+    rows = (sb().table("profiles")
+            .select("id, company, role, trade, region, license_no, "
+                    "verification_status, email")
+            .order("company").execute().data)
+    if q.strip():
+        n = q.strip().lower()
+        rows = [r for r in rows if n in " ".join(
+            filter(None, [r.get("company"), r.get("trade"),
+                          r.get("region"), r.get("email")])).lower()]
+    for r in rows:
+        st.markdown(
+            f'<div class="card"><b>{r["company"]}</b>{verified_badge(r)}'
+            f' <span class="f-mono" style="font-size:11px;'
+            f'color:{C["blue"]}">{r["role"].upper()}</span>'
+            f'<div class="f-mono" style="font-size:11px;color:{C["inkSoft"]}">'
+            f'{r.get("email")} · {r.get("trade") or "—"} · '
+            f'{r.get("region") or "—"} · CSLB {r.get("license_no") or "—"} · '
+            f'status: {r["verification_status"]}</div></div>',
+            unsafe_allow_html=True)
+        if st.button("View profile", key=f"adminprof_{r['id']}"):
+            st.session_state.view_profile = r["id"]
+            st.rerun()
+
+
+def screen_admin_rfps():
+    heading("ALL RFPS & BIDS")
+    itbs = (sb().table("itbs").select("*")
+            .order("created_at", desc=True).execute().data)
+    if not itbs:
+        st.info("No RFPs posted yet.")
+        return
+    gc_names = {p["id"]: p["company"] for p in
+                sb().table("profiles").select("id, company")
+                .in_("id", list({i["gc_id"] for i in itbs})).execute().data}
+    for itb in itbs:
+        bids = (sb().table("bids").select("sub_id, amount, revision")
+                .eq("itb_id", itb["id"]).execute().data)
+        latest = latest_bids_by_sub(bids)
+        with st.expander(f"ITB-{itb['id']:04d} · {itb['project']} — "
+                         f"{itb['trade']} · {gc_names.get(itb['gc_id'], 'GC')} "
+                         f"({len(latest)} bids, {itb.get('visibility')}, "
+                         f"due {itb['due_date']})"):
+            if not latest:
+                st.markdown(f'<div style="color:{C["inkSoft"]}">No bids.</div>',
+                            unsafe_allow_html=True)
+                continue
+            names = {p["id"]: p["company"] for p in
+                     sb().table("profiles").select("id, company")
+                     .in_("id", list(latest.keys())).execute().data}
+            for b in sorted(latest.values(), key=lambda x: x["amount"]):
+                st.markdown(f'- **{names.get(b["sub_id"], "Sub")}** — '
+                            f'${b["amount"]:,.0f}'
+                            + (f' (rev {b["revision"]})'
+                               if b["revision"] > 1 else ""))
+
+
+def screen_admin_queue():
+    heading("VERIFICATION QUEUE")
+
+    # ── pending profile verifications ──
+    pend = (sb().table("profiles").select("*")
+            .eq("verification_status", "pending").execute().data)
+    st.markdown('<div class="eyebrow">PENDING LICENSE VERIFICATIONS</div>',
+                unsafe_allow_html=True)
+    if not pend:
+        st.markdown(f'<div style="color:{C["inkSoft"]}">None pending.</div>',
+                    unsafe_allow_html=True)
+    for p in pend:
+        st.markdown(
+            f'<div class="card"><b>{p["company"]}</b> ({p["role"].upper()})'
+            f'<div class="f-mono" style="font-size:11px;color:{C["inkSoft"]}">'
+            f'Profile company: {p["company"]} · CSLB record: '
+            f'{p.get("cslb_business") or "not parsed"} · '
+            f'license {p.get("license_no") or "—"} · '
+            f'status: {p.get("cslb_status") or "—"}</div></div>',
+            unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        if c1.button("Approve", key=f"vok_{p['id']}"):
+            sb().table("profiles").update({
+                "verification_status": "verified",
+                "verified_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", p["id"]).execute()
+            st.rerun()
+        if c2.button("Reject", key=f"vno_{p['id']}"):
+            sb().table("profiles").update(
+                {"verification_status": "rejected"}).eq(
+                "id", p["id"]).execute()
+            st.rerun()
+
+    # ── pending documents ──
+    st.markdown('<div class="eyebrow" style="margin-top:14px">'
+                'DOCUMENTS AWAITING REVIEW</div>', unsafe_allow_html=True)
+    docs = (sb().table("verification_docs").select("*")
+            .eq("status", "pending").order("created_at").execute().data)
+    if not docs:
+        st.markdown(f'<div style="color:{C["inkSoft"]}">None pending.</div>',
+                    unsafe_allow_html=True)
+        return
+    owners = {p["id"]: p["company"] for p in
+              sb().table("profiles").select("id, company")
+              .in_("id", list({d["user_id"] for d in docs})).execute().data}
+    for d in docs:
+        url = None
+        try:
+            signed = sb().storage.from_("docs").create_signed_url(
+                d["path"], 3600)
+            url = signed.get("signedURL") or signed.get("signed_url")
+        except Exception:
+            pass
+        st.markdown(
+            f'<div class="card"><b>{owners.get(d["user_id"], "User")}</b> — '
+            f'{d["doc_type"]}'
+            f'<div class="f-mono" style="font-size:11px;'
+            f'color:{C["inkSoft"]}">{d["filename"]} · '
+            f'submitted {str(d["created_at"])[:10]}</div></div>',
+            unsafe_allow_html=True)
+        if url:
+            st.markdown(f"[📄 Open document]({url})")
+        c1, c2, c3 = st.columns([1, 1, 2])
+        if c1.button("Approve", key=f"dok_{d['id']}"):
+            sb().table("verification_docs").update({
+                "status": "approved",
+                "reviewed_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", d["id"]).execute()
+            st.rerun()
+        rej_note = c3.text_input("Rejection note (optional)",
+                                 key=f"dnote_{d['id']}",
+                                 label_visibility="collapsed",
+                                 placeholder="Reason if rejecting…")
+        if c2.button("Reject", key=f"dno_{d['id']}"):
+            sb().table("verification_docs").update({
+                "status": "rejected",
+                "note": rej_note.strip() or None,
+                "reviewed_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", d["id"]).execute()
+            st.rerun()
+
+
+def screen_admin_feedback():
+    heading("FEEDBACK INBOX")
+    rows = (sb().table("feedback").select("*")
+            .order("created_at", desc=True).execute().data)
+    if not rows:
+        st.info("No feedback yet.")
+        return
+    users = {p["id"]: p for p in
+             sb().table("profiles").select("id, company, role, email")
+             .in_("id", list({r["user_id"] for r in rows})).execute().data}
+    open_rows = [r for r in rows if r["status"] == "open"]
+    done_rows = [r for r in rows if r["status"] != "open"]
+    for group, label in ((open_rows, "OPEN"), (done_rows, "RESOLVED")):
+        if not group:
+            continue
+        st.markdown(f'<div class="eyebrow" style="margin-top:10px">{label} '
+                    f'({len(group)})</div>', unsafe_allow_html=True)
+        for r in group:
+            u = users.get(r["user_id"], {})
+            st.markdown(
+                f'<div class="card"><b>{u.get("company", "User")}</b> '
+                f'<span class="f-mono" style="font-size:11px;'
+                f'color:{C["blue"]}">{u.get("role", "").upper()}</span>'
+                f'<div style="color:{C["ink"]};margin-top:4px">'
+                f'{r["message"]}</div>'
+                f'<div class="f-mono" style="font-size:10px;'
+                f'color:{C["inkSoft"]}">{u.get("email", "")} · '
+                f'{str(r["created_at"])[:16].replace("T", " ")}</div></div>',
+                unsafe_allow_html=True)
+            if r["status"] == "open":
+                if st.button("Mark resolved", key=f"fbres_{r['id']}"):
+                    sb().table("feedback").update(
+                        {"status": "resolved"}).eq("id", r["id"]).execute()
+                    st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────────────
 #  MAIN ROUTER
 # ─────────────────────────────────────────────────────────────────────
 require_secrets()
+
+try_restore_session()          # stay logged in across page refreshes
+
+if handle_password_recovery(): # reset-link flow owns the page when active
+    st.stop()
 
 if "user_id" not in st.session_state:
     screen_auth()
@@ -1416,14 +1981,18 @@ with st.sidebar:
     check = " ✓" if is_verified(profile) else ""
     st.markdown(f'<div class="f-mono" style="font-size:10px;color:#7FA98C;'
                 f'margin-top:4px">{profile["company"].upper()} · '
-                f'{"GC" if profile["role"] == "gc" else "SUB"}{check}</div>',
+                f'{profile["role"].upper()}{check}</div>',
                 unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
-    nav_items = (["My Profile", "Dashboard", "New Bid Request",
-                  "Bid Requests", "Sub Network", "Get Verified"]
-                 if profile["role"] == "gc" else
-                 ["My Profile", "Bid Invites", "RFP Board", "Find GCs",
-                  "Get Verified"])
+    if profile["role"] == "admin":
+        nav_items = ["Admin Home", "Users", "All RFPs", "Verification Queue",
+                     "Feedback Inbox"]
+    elif profile["role"] == "gc":
+        nav_items = ["My Profile", "Dashboard", "New Bid Request",
+                     "Bid Requests", "Sub Network", "Get Verified"]
+    else:
+        nav_items = ["My Profile", "Bid Invites", "RFP Board", "Find GCs",
+                     "Get Verified"]
     if st.session_state.get("page") not in nav_items:
         st.session_state.page = nav_items[0]
     for item in nav_items:
@@ -1435,6 +2004,8 @@ with st.sidebar:
             st.rerun()
     page = st.session_state.page
     st.markdown("<br>", unsafe_allow_html=True)
+    if profile["role"] != "admin":
+        feedback_widget()
     if st.button("Log out"):
         sign_out()
         st.rerun()
@@ -1442,6 +2013,17 @@ with st.sidebar:
 # Viewing someone's profile takes over the page until Back is clicked
 if st.session_state.get("view_profile"):
     screen_public_profile(st.session_state.view_profile)
+elif profile["role"] == "admin":
+    if page == "Admin Home":
+        screen_admin_home(profile)
+    elif page == "Users":
+        screen_admin_users()
+    elif page == "All RFPs":
+        screen_admin_rfps()
+    elif page == "Verification Queue":
+        screen_admin_queue()
+    else:
+        screen_admin_feedback()
 elif page == "Get Verified":
     screen_verify(profile)
 elif page == "My Profile":
