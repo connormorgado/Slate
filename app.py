@@ -402,28 +402,51 @@ def handle_password_recovery():
 #  SCREEN: PUBLIC LANDING PAGE  (what visitors see before logging in)
 # ─────────────────────────────────────────────────────────────────────
 def _land_card(title, body):
-    return (f'<div class="card" style="min-height:120px"><b style="font-size:17px">'
+    return (f'<div class="card reveal" style="min-height:120px"><b style="font-size:17px">'
             f'{title}</b><div style="color:{C["inkSoft"]};font-size:15px;'
             f'margin-top:6px">{body}</div></div>')
 
 
 def screen_landing():
-    # header row: brand left, LOG IN top right
-    h1, h2 = st.columns([5, 1])
+    # scroll-reveal styling (progressively enhanced — browsers without
+    # scroll-driven animation support just show content normally)
+    st.markdown('''<style>
+    @supports (animation-timeline: view()) {
+      .reveal { animation: slate-rise both;
+                animation-timeline: view();
+                animation-range: entry 0% entry 55%; }
+      @keyframes slate-rise {
+        from { opacity: 0; transform: translateY(26px); }
+        to   { opacity: 1; transform: none; }
+      }
+    }
+    @media (prefers-reduced-motion: reduce) { .reveal { animation: none; } }
+    </style>''', unsafe_allow_html=True)
+
+    # header row: brand left, both CTAs top right
+    h1, h2, h3 = st.columns([4, 1.6, 0.9])
     with h1:
         st.markdown('<div class="f-disp" style="font-size:22px;font-weight:700;'
-                    f'color:{C["ink"]};letter-spacing:2px">SLATE'
+                    f'color:{C["ink"]};letter-spacing:2px;padding-top:6px">SLATE'
                     '<span style="color:#1D7A44">.</span></div>',
                     unsafe_allow_html=True)
     with h2:
+        if st.button("Create your free account", key="cta_top"):
+            st.session_state.show_login = True
+            st.rerun()
+    with h3:
         if st.button("LOG IN", key="land_login"):
             st.session_state.show_login = True
             st.rerun()
+    st.markdown(f'<div class="f-mono" style="font-size:11px;'
+                f'color:{C["inkSoft"]};text-align:right;margin-top:-6px">'
+                f'Free during the founding-member pilot · '
+                f'San Francisco Bay Area</div>', unsafe_allow_html=True)
 
     # hero — dark panel with the glowing logo
     st.markdown(
-        f'<div style="background:#0D0F0E;border-radius:10px;padding:48px 30px;'
-        f'text-align:center;margin:8px 0 20px 0">'
+        f'<div class="reveal" style="background:#0D0F0E;border-radius:10px;'
+        f'padding:48px 30px;text-align:center;margin:8px 0 20px 0">'
         f'{logo_html(width=210)}'
         f'<div class="f-disp" style="font-size:34px;font-weight:700;'
         f'color:#FFFFFF;margin-top:18px;line-height:1.15">THE BID NETWORK '
@@ -433,15 +456,6 @@ def screen_landing():
         f'CSLB-verified subcontractors — post bid requests, collect and level '
         f'bids, and award scopes, all in one place.</div>'
         f'</div>', unsafe_allow_html=True)
-
-    c1, c2 = st.columns(2)
-    if c1.button("Create your free account", key="cta_top"):
-        st.session_state.show_login = True
-        st.rerun()
-    c2.markdown(f'<div class="f-mono" style="font-size:11px;'
-                f'color:{C["inkSoft"]};padding-top:10px">Free during the '
-                f'founding-member pilot · San Francisco Bay Area</div>',
-                unsafe_allow_html=True)
 
     # for GCs / for Subs
     st.markdown('<div class="eyebrow" style="margin-top:18px">WHAT SLATE '
@@ -495,8 +509,8 @@ def screen_landing():
 
     # founder story + closing CTA
     st.markdown(
-        f'<div style="background:#0D0F0E;border-radius:10px;padding:34px 30px;'
-        f'text-align:center;margin-top:20px">'
+        f'<div class="reveal" style="background:#0D0F0E;border-radius:10px;'
+        f'padding:34px 30px;text-align:center;margin-top:20px">'
         f'<div class="f-disp" style="font-size:24px;font-weight:700;'
         f'color:#FFFFFF">NOT BUILT IN A TECH OFFICE.</div>'
         f'<div style="color:#BFCCC2;font-size:16px;max-width:620px;'
@@ -506,13 +520,6 @@ def screen_landing():
         f'needs, and we ship improvements from user feedback in days, '
         f'not quarters.</div></div>', unsafe_allow_html=True)
 
-    f1, f2 = st.columns(2)
-    if f1.button("Create your free account ", key="cta_bottom"):
-        st.session_state.show_login = True
-        st.rerun()
-    if f2.button("Log in to SLATE", key="login_bottom"):
-        st.session_state.show_login = True
-        st.rerun()
     st.markdown(f'<div class="f-mono" style="font-size:10px;'
                 f'color:{C["inkSoft"]};text-align:center;margin-top:14px">'
                 f'BY CONTRACTORS, FOR CONTRACTORS · © 2026 SLATE</div>',
