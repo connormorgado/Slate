@@ -1,0 +1,10 @@
+# SLATE theme — locks the app to its brand palette so a phone or
+# browser in dark mode can't flip Streamlit's base theme and make
+# labels/text invisible against our light background.
+
+[theme]
+base = "light"
+primaryColor = "#1D7A44"
+backgroundColor = "#EDEFEA"
+secondaryBackgroundColor = "#FAFBF8"
+textColor = "#141B17"
