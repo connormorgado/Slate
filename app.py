@@ -50,10 +50,7 @@ except Exception:
 
 from cslb import check_license
 
-try:
-    from streamlit_cookies_controller import CookieController
-except Exception:
-    CookieController = None
+import streamlit.components.v1 as components
 
 # CSLB contractor classifications (common set — extend anytime)
 TRADES = [
@@ -219,43 +216,38 @@ def require_secrets():
         st.stop()
 
 
-def _get_cookies():
-    if CookieController is None:
-        return None
-    if "_cookie_ctl" not in st.session_state:
-        st.session_state._cookie_ctl = CookieController()
-    return st.session_state._cookie_ctl
+COOKIE_NAME = "slate_rt"
 
 
-def _save_session_cookie(session):
-    """Persist the refresh token so a page refresh doesn't log you out."""
-    ctl = _get_cookies()
-    if ctl and session and getattr(session, "refresh_token", None):
-        try:
-            ctl.set("slate_rt", session.refresh_token,
-                    max_age=60 * 60 * 24 * 30)
-        except Exception:
-            pass
+def _queue_session_cookie(session):
+    """Queue the refresh token to be written to the browser on the NEXT
+    stable page render. Writing immediately before st.rerun() loses the
+    cookie — the rerun cancels the render before the browser gets it."""
+    if session and getattr(session, "refresh_token", None):
+        st.session_state._pending_rt = session.refresh_token
 
 
-def _clear_session_cookie():
-    ctl = _get_cookies()
-    if ctl:
-        try:
-            ctl.remove("slate_rt")
-        except Exception:
-            pass
+def flush_cookie_writes():
+    """Render any queued cookie writes/deletes. Called once at the top of
+    every page run, after any st.rerun() that queued them has completed."""
+    rt = st.session_state.pop("_pending_rt", None)
+    if rt:
+        components.html(
+            f"<script>document.cookie='{COOKIE_NAME}={rt}; path=/; "
+            f"max-age=2592000; SameSite=Lax';</script>", height=0)
+    if st.session_state.pop("_clear_rt", None):
+        components.html(
+            f"<script>document.cookie='{COOKIE_NAME}=; path=/; "
+            f"max-age=0; SameSite=Lax';</script>", height=0)
 
 
 def try_restore_session():
-    """On page load, quietly log back in from the browser cookie."""
+    """On page load, quietly log back in from the browser cookie.
+    Reads via st.context.cookies (native, present on the first run)."""
     if "user_id" in st.session_state:
         return
-    ctl = _get_cookies()
-    if ctl is None:
-        return
     try:
-        rt = ctl.get("slate_rt")
+        rt = st.context.cookies.get(COOKIE_NAME)
     except Exception:
         return
     if not rt:
@@ -266,9 +258,9 @@ def try_restore_session():
             st.session_state.access_token = res.session.access_token
             st.session_state.user_id = res.user.id
             st.session_state.user_email = res.user.email
-            _save_session_cookie(res.session)   # tokens rotate — save the new one
+            _queue_session_cookie(res.session)   # tokens rotate: store new one
     except Exception:
-        _clear_session_cookie()
+        st.session_state._clear_rt = True        # stale token — clean it up
 
 
 def sign_in(email, password):
@@ -276,7 +268,7 @@ def sign_in(email, password):
     st.session_state.access_token = res.session.access_token
     st.session_state.user_id = res.user.id
     st.session_state.user_email = res.user.email
-    _save_session_cookie(res.session)
+    _queue_session_cookie(res.session)
 
 
 def sign_up(email, password):
@@ -290,11 +282,11 @@ def sign_up(email, password):
     st.session_state.access_token = res.session.access_token
     st.session_state.user_id = res.user.id
     st.session_state.user_email = res.user.email
-    _save_session_cookie(res.session)
+    _queue_session_cookie(res.session)
 
 
 def sign_out():
-    _clear_session_cookie()
+    st.session_state._clear_rt = True
     try:
         get_client().auth.sign_out()
     except Exception:
@@ -1963,6 +1955,7 @@ def screen_admin_feedback():
 require_secrets()
 
 try_restore_session()          # stay logged in across page refreshes
+flush_cookie_writes()          # write any queued cookie from the last run
 
 if handle_password_recovery(): # reset-link flow owns the page when active
     st.stop()
