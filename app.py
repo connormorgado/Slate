@@ -488,6 +488,104 @@ def screen_onboarding():
 # ─────────────────────────────────────────────────────────────────────
 #  SHARED HELPERS
 # ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
+#  ACTIVITY TRACKING + BID Q&A HELPERS
+# ─────────────────────────────────────────────────────────────────────
+def touch_last_seen():
+    """Record activity, at most once per 10 minutes per session, so
+    Streamlit's constant reruns don't hammer the database."""
+    now = time.time()
+    if now - st.session_state.get("_ls_ts", 0) > 600:
+        try:
+            sb().table("profiles").update(
+                {"last_seen": datetime.now(timezone.utc).isoformat()}
+            ).eq("id", st.session_state.user_id).execute()
+        except Exception:
+            pass
+        st.session_state._ls_ts = now
+
+
+def activity_label(last_seen):
+    """Human-friendly activity signal shown on profiles and cards."""
+    if not last_seen:
+        return "⚪ New to SLATE"
+    try:
+        dt = datetime.fromisoformat(str(last_seen).replace("Z", "+00:00"))
+    except Exception:
+        return ""
+    delta = datetime.now(timezone.utc) - dt
+    if delta.total_seconds() < 3600:
+        return "🟢 Active now"
+    if delta.days < 1:
+        return "🟢 Active today"
+    if delta.days < 7:
+        return "🟢 Active this week"
+    return f"⚪ Last seen {delta.days}d ago"
+
+
+def activity_chip(last_seen):
+    lbl = activity_label(last_seen)
+    return (f' <span class="f-mono" style="font-size:10px;'
+            f'color:{C["inkSoft"]}">{lbl}</span>' if lbl else "")
+
+
+def bid_thread(itb_id, sub_id, msgs, other_name, other_email,
+               itb_project, my_company):
+    """In-bid Q&A thread between the GC and one sub. Rendered as a
+    toggle (not an expander — these sit inside expanders already).
+    Replaces the email back-and-forth for pricing questions and
+    revision requests."""
+    tkey = f"thread_open_{itb_id}_{sub_id}"
+    if st.button(f"💬 Bid Q&A ({len(msgs)})", key=f"tgl_{itb_id}_{sub_id}"):
+        st.session_state[tkey] = not st.session_state.get(tkey, False)
+        st.rerun()
+    if not st.session_state.get(tkey):
+        return
+
+    for m in msgs:
+        mine = m["sender_id"] == st.session_state.user_id
+        who = "You" if mine else other_name
+        align = "margin-left:14%" if mine else "margin-right:14%"
+        bg = "#E3EFE6" if mine else C["white"]
+        st.markdown(
+            f'<div class="card" style="{align};background:{bg};'
+            f'padding:10px 14px;margin-bottom:6px">'
+            f'<span class="f-mono" style="font-size:10px;'
+            f'color:{C["inkSoft"]}">{who} · '
+            f'{str(m["created_at"])[:16].replace("T", " ")}</span>'
+            f'<div style="color:{C["ink"]}">{m["message"]}</div></div>',
+            unsafe_allow_html=True)
+
+    gen = st.session_state.get("msg_gen", 0)
+    txt = st.text_input("Message", key=f"bm_{itb_id}_{sub_id}_{gen}",
+                        label_visibility="collapsed",
+                        placeholder="Ask a question, request a revision, "
+                                    "clarify pricing…")
+    if st.button("Send", key=f"bms_{itb_id}_{sub_id}"):
+        if not txt.strip():
+            st.error("Write a message first.")
+        else:
+            sb().table("bid_messages").insert({
+                "itb_id": itb_id, "sub_id": sub_id,
+                "sender_id": st.session_state.user_id,
+                "message": txt.strip(),
+            }).execute()
+            st.session_state.msg_gen = gen + 1
+            if other_email:
+                app_url = st.secrets.get("APP_URL",
+                                         "https://slate-bids.streamlit.app")
+                send_simple_email(
+                    other_email,
+                    f"New bid message: {itb_project}",
+                    f"<p><b>{my_company}</b> sent a message on the bid for "
+                    f"<b>{itb_project}</b>:</p>"
+                    f"<p style='border-left:3px solid #1D7A44;"
+                    f"padding-left:10px'>{txt.strip()}</p>"
+                    f"<p><a href='{app_url}'>Reply in SLATE</a> — keep the "
+                    f"whole conversation with the bid.</p>")
+            st.rerun()
+
+
 def latest_bids_by_sub(bids):
     """From all bid rows on an ITB, keep only each sub's latest revision."""
     latest = {}
@@ -931,9 +1029,17 @@ def screen_gc_dashboard(profile):
                 continue
 
             # names + any bid documents, fetched once per ITB
-            names = {p["id"]: p["company"] for p in
-                     sb().table("profiles").select("id, company")
-                     .in_("id", list(latest.keys())).execute().data}
+            subs_info = {p["id"]: p for p in
+                         sb().table("profiles")
+                         .select("id, company, email, last_seen")
+                         .in_("id", list(latest.keys())).execute().data}
+            names = {k: v["company"] for k, v in subs_info.items()}
+            all_msgs = (sb().table("bid_messages").select("*")
+                        .eq("itb_id", itb["id"])
+                        .order("created_at").execute().data)
+            msgs_by_sub = {}
+            for m in all_msgs:
+                msgs_by_sub.setdefault(m["sub_id"], []).append(m)
             bid_ids = [b["id"] for b in latest.values()]
             files_by_bid = {}
             for f in (sb().table("bid_files").select("bid_id, path, filename")
@@ -960,7 +1066,8 @@ def screen_gc_dashboard(profile):
                              'font-size:11px">NOT SELECTED</span>')
 
                 st.markdown(
-                    f'<div class="card"><b>{sub_name}</b> — '
+                    f'<div class="card"><b>{sub_name}</b>'
+                    f'{activity_chip(subs_info.get(b["sub_id"], {}).get("last_seen"))} — '
                     f'<span class="f-disp" style="font-size:20px;font-weight:600">'
                     f'${b["amount"]:,.0f}</span>{tags}'
                     f'<div style="color:{C["inkSoft"]};font-size:14px">'
@@ -971,6 +1078,12 @@ def screen_gc_dashboard(profile):
                     url = signed_link(f["path"])
                     st.markdown(f"- 📎 [{f['filename']}]({url})" if url
                                 else f"- 📎 {f['filename']} (link unavailable)")
+
+                bid_thread(itb["id"], b["sub_id"],
+                           msgs_by_sub.get(b["sub_id"], []),
+                           sub_name,
+                           subs_info.get(b["sub_id"], {}).get("email"),
+                           itb["project"], profile["company"])
 
                 if invite and invite["status"] == "awarded":
                     vdocs = (sb().table("verification_docs")
@@ -1051,9 +1164,11 @@ def screen_sub_inbox(profile):
         if not itb:
             continue
         itb = itb[0]
-        gc = (sb().table("profiles").select("company")
+        gc = (sb().table("profiles").select("company, email, last_seen")
               .eq("id", itb["gc_id"]).execute().data)
         gc_name = gc[0]["company"] if gc else "GC"
+        gc_email = gc[0].get("email") if gc else None
+        gc_seen = gc[0].get("last_seen") if gc else None
         badge = BADGES.get(v["status"], v["status"])
 
         with st.expander(f"{badge} · {itb['project']} — {itb['trade']} "
@@ -1066,10 +1181,21 @@ def screen_sub_inbox(profile):
                             f'to another sub. Thanks for bidding — your response '
                             f'record still counts.</div>', unsafe_allow_html=True)
 
+            st.markdown(f'<div class="f-mono" style="font-size:10px;'
+                        f'color:{C["inkSoft"]}">{gc_name}: '
+                        f'{activity_label(gc_seen)}</div>',
+                        unsafe_allow_html=True)
             if itb.get("scope"):
                 st.markdown(f'<div class="eyebrow">SCOPE</div>'
                             f'<div style="color:{C["ink"]}">{itb["scope"]}</div>',
                             unsafe_allow_html=True)
+
+            th_msgs = (sb().table("bid_messages").select("*")
+                       .eq("itb_id", itb["id"])
+                       .eq("sub_id", st.session_state.user_id)
+                       .order("created_at").execute().data)
+            bid_thread(itb["id"], st.session_state.user_id, th_msgs,
+                       gc_name, gc_email, itb["project"], profile["company"])
 
             # drawings via short-lived signed URLs (private bucket)
             fs = (sb().table("itb_files").select("path, filename")
@@ -1148,7 +1274,7 @@ def screen_directory(profile):
                       placeholder="Search by company, trade, or region…")
     rows = (sb().table("profiles")
             .select("id, company, trade, region, license_no, "
-                    "verification_status")
+                    "verification_status, last_seen")
             .eq("role", looking_for).order("company").execute().data)
     if q.strip():
         needle = q.strip().lower()
@@ -1179,6 +1305,7 @@ def screen_directory(profile):
                      if looking_for == "sub" else "General Contractor")
         st.markdown(
             f'<div class="card"><b>{s["company"]}</b>{badge}{extra}'
+            f'{activity_chip(s.get("last_seen"))}'
             f'<div class="f-mono" style="font-size:11px;color:{C["inkSoft"]}">'
             f'{role_line} · {s.get("region") or ""} · '
             f'CSLB {s.get("license_no") or "—"}</div></div>',
@@ -1228,9 +1355,10 @@ def screen_rfp_board(profile):
     my_requests = {r["itb_id"]: r for r in
                    sb().table("bid_requests").select("itb_id, status")
                    .eq("sub_id", st.session_state.user_id).execute().data}
-    gc_names = {p["id"]: p["company"] for p in
-                sb().table("profiles").select("id, company")
-                .in_("id", list({r["gc_id"] for r in rfps})).execute().data}
+    gc_rows = {p["id"]: p for p in
+               sb().table("profiles").select("id, company, last_seen")
+               .in_("id", list({r["gc_id"] for r in rfps})).execute().data}
+    gc_names = {k: v["company"] for k, v in gc_rows.items()}
 
     for r in rfps:
         gc_name = gc_names.get(r["gc_id"], "GC")
@@ -1242,6 +1370,10 @@ def screen_rfp_board(profile):
                          help="View this GC's profile and portfolio"):
                 st.session_state.view_profile = r["gc_id"]
                 st.rerun()
+            st.markdown(f'<div class="f-mono" style="font-size:10px;'
+                        f'color:{C["inkSoft"]}">'
+                        f'{activity_label(gc_rows.get(r["gc_id"], {}).get("last_seen"))}'
+                        f'</div>', unsafe_allow_html=True)
             meta = (f'📍 {r.get("location") or "location TBD"} · '
                     f'🗓 {r.get("start_date") or "TBD"} → {r.get("end_date") or "TBD"}')
             if r.get("trades"):
@@ -1312,7 +1444,8 @@ def screen_gc_requests(profile):
 
     sub_profiles = {p["id"]: p for p in
                     sb().table("profiles")
-                    .select("id, company, trade, region, verification_status")
+                    .select("id, company, trade, region, "
+                            "verification_status, last_seen")
                     .in_("id", list({r["sub_id"] for r in reqs})).execute().data}
 
     pending = [r for r in reqs if r["status"] == "requested"]
@@ -1329,7 +1462,7 @@ def screen_gc_requests(profile):
             s = sub_profiles.get(rq["sub_id"], {})
             st.markdown(
                 f'<div class="card"><b>{s.get("company","Sub")}</b>'
-                f'{verified_badge(s)}'
+                f'{verified_badge(s)}{activity_chip(s.get("last_seen"))}'
                 f'<div class="f-mono" style="font-size:11px;color:{C["inkSoft"]}">'
                 f'{s.get("trade") or ""} · {s.get("region") or ""} — wants to bid '
                 f'on <b>{itb["project"]} / {itb["trade"]}</b></div>'
@@ -1650,7 +1783,7 @@ def screen_my_profile(profile):
 def screen_public_profile(uid):
     rows = (sb().table("profiles")
             .select("id, company, role, trade, region, license_no, "
-                    "verification_status, cslb_expires")
+                    "verification_status, cslb_expires, last_seen")
             .eq("id", uid).execute().data)
     if not rows:
         st.error("Profile not found.")
@@ -1662,6 +1795,7 @@ def screen_public_profile(uid):
     heading(p["company"].upper())
     st.markdown(
         f'<div class="card">{verified_badge(p) or "Not yet verified"}'
+        f'{activity_chip(p.get("last_seen"))}'
         f'<div class="f-mono" style="font-size:11px;color:{C["inkSoft"]}">'
         f'{"General Contractor" if p["role"] == "gc" else p.get("trade") or "Subcontractor"} · '
         f'{p.get("region") or ""} · CSLB {p.get("license_no") or "—"}'
@@ -1739,7 +1873,8 @@ def feedback_widget():
 def screen_admin_home(profile):
     heading("SLATE ADMIN")
     profiles_all = (sb().table("profiles")
-                    .select("id, role, verification_status").execute().data)
+                    .select("id, role, verification_status, last_seen, "
+                            "created_at").execute().data)
     itbs_all = sb().table("itbs").select("id").execute().data
     bids_all = (sb().table("bids").select("itb_id, sub_id, amount, revision")
                 .execute().data)
@@ -1765,6 +1900,31 @@ def screen_admin_home(profile):
                  ("Pending verifications", len(ver_pending)),
                  ("Docs awaiting review", len(docs_pending)),
                  ("Open feedback", len(fb_open))])
+
+    def _days_ago(ts):
+        if not ts:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            return (datetime.now(timezone.utc) - dt).days
+        except Exception:
+            return None
+
+    contractors = [p for p in profiles_all if p["role"] != "admin"]
+    seen_days = [(_days_ago(p.get("last_seen"))) for p in contractors]
+    active7 = sum(1 for d in seen_days if d is not None and d < 7)
+    active30 = sum(1 for d in seen_days if d is not None and d < 30)
+    inactive30 = sum(1 for d in seen_days if d is None or d >= 30)
+    new_week = sum(1 for p in contractors
+                   if (_days_ago(p.get("created_at")) or 99) < 7)
+    _stat_cards([("Active last 7 days", active7),
+                 ("Active last 30 days", active30),
+                 ("Inactive 30+ days", inactive30),
+                 ("New signups this week", new_week)])
+    st.markdown(f'<div class="f-mono" style="font-size:10px;'
+                f'color:{C["inkSoft"]}">Activity counts from when tracking '
+                f'went live — accounts never seen since then count as '
+                f'inactive.</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="f-mono" style="font-size:11px;'
                 f'color:{C["inkSoft"]}">Pending items live in the '
                 f'Verification Queue and Feedback Inbox.</div>',
@@ -1777,7 +1937,7 @@ def screen_admin_users():
                       placeholder="Search company, trade, or region…")
     rows = (sb().table("profiles")
             .select("id, company, role, trade, region, license_no, "
-                    "verification_status, email")
+                    "verification_status, email, last_seen")
             .order("company").execute().data)
     if q.strip():
         n = q.strip().lower()
@@ -1789,6 +1949,7 @@ def screen_admin_users():
             f'<div class="card"><b>{r["company"]}</b>{verified_badge(r)}'
             f' <span class="f-mono" style="font-size:11px;'
             f'color:{C["blue"]}">{r["role"].upper()}</span>'
+            f'{activity_chip(r.get("last_seen"))}'
             f'<div class="f-mono" style="font-size:11px;color:{C["inkSoft"]}">'
             f'{r.get("email")} · {r.get("trade") or "—"} · '
             f'{r.get("region") or "—"} · CSLB {r.get("license_no") or "—"} · '
@@ -1968,6 +2129,8 @@ profile = st.session_state.get("profile") or load_profile()
 if profile is None:
     screen_onboarding()
     st.stop()
+
+touch_last_seen()
 
 with st.sidebar:
     st.markdown(logo_html(width=150), unsafe_allow_html=True)
