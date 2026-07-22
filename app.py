@@ -869,19 +869,21 @@ def screen_verify(profile):
         with st.spinner("Checking CSLB…"):
             result = check_license(lic.strip())
         if not result.get("ok"):
-            st.warning(f"The automated lookup didn't go through "
-                       f"({result.get('error', 'lookup failed')}). "
-                       f"You can [check your license manually]({result['url']}) "
-                       f"and submit for review below.")
-            if st.button("Submit for manual review"):
-                sb().table("profiles").update({
-                    "license_no": lic.strip(),
-                    "verification_status": "pending",
-                }).eq("id", st.session_state.user_id).execute()
-                st.session_state.profile = {**profile, "license_no": lic.strip(),
-                                            "verification_status": "pending"}
-                st.rerun()
-            return
+            # CSLB's site sometimes blocks automated lookups — queue for
+            # manual review automatically so nobody hits a dead end.
+            sb().table("profiles").update({
+                "license_no": lic.strip(),
+                "verification_status": "pending",
+            }).eq("id", st.session_state.user_id).execute()
+            st.session_state.profile = {**profile,
+                                        "license_no": lic.strip(),
+                                        "verification_status": "pending"}
+            st.info("The automated CSLB lookup couldn't complete, so your "
+                    "license has been sent to SLATE for manual review — "
+                    "usually same-day. You'll get an email when you're "
+                    "approved.")
+            time.sleep(2)
+            st.rerun()
         outcome = apply_verification(result, lic.strip(), profile)
         role_mismatch_check(st.session_state.profile, result.get("classes"))
         if outcome == "verified":
@@ -910,7 +912,7 @@ def screen_new_itb(profile):
 
     subs = (sb().table("profiles")
             .select("id, company, trade, region, email, trades, work_states, "
-                    "work_cities")
+                    "work_cities, notify_bid_activity")
             .eq("role", "sub")
             .eq("verification_status", "verified").execute().data)
 
@@ -1040,7 +1042,9 @@ def screen_new_itb(profile):
                 state_ok = (sm.get("work_states")
                             and r_state in sm["work_states"])
                 already = any(p2["id"] == sm["id"] for p2 in picked)
-                if trade_ok and state_ok and not already and sm.get("email"):
+                if (trade_ok and state_ok and not already
+                        and sm.get("email")
+                        and sm.get("notify_bid_activity") is not False):
                     ok = send_simple_email(
                         sm["email"],
                         f"New RFP in your area: {project.strip()}",
@@ -1139,7 +1143,8 @@ def screen_gc_dashboard(profile):
             # names + any bid documents, fetched once per ITB
             subs_info = {p["id"]: p for p in
                          sb().table("profiles")
-                         .select("id, company, email, last_seen")
+                         .select("id, company, email, last_seen, "
+                                 "notify_messages, notify_bid_activity")
                          .in_("id", list(latest.keys())).execute().data}
             names = {k: v["company"] for k, v in subs_info.items()}
             all_msgs = (sb().table("bid_messages").select("*")
@@ -1187,10 +1192,13 @@ def screen_gc_dashboard(profile):
                     st.markdown(f"- 📎 [{f['filename']}]({url})" if url
                                 else f"- 📎 {f['filename']} (link unavailable)")
 
+                _si = subs_info.get(b["sub_id"], {})
                 bid_thread(itb["id"], b["sub_id"],
                            msgs_by_sub.get(b["sub_id"], []),
                            sub_name,
-                           subs_info.get(b["sub_id"], {}).get("email"),
+                           (_si.get("email")
+                            if _si.get("notify_messages") is not False
+                            else None),
                            itb["project"], profile["company"])
 
                 if invite and invite["status"] == "awarded":
@@ -1217,7 +1225,8 @@ def screen_gc_dashboard(profile):
                                  key=f"award_{itb['id']}_{b['sub_id']}"):
                         all_invited = {p["id"]: p for p in
                                        sb().table("profiles")
-                                       .select("id, company, email")
+                                       .select("id, company, email, "
+                                               "notify_bid_activity")
                                        .in_("id", [v["sub_id"]
                                                    for v in invites])
                                        .execute().data}
@@ -1231,7 +1240,9 @@ def screen_gc_dashboard(profile):
                             sb().table("itb_invites").update(
                                 {"status": new_status}).eq("id", v["id"]).execute()
                             inv_p = all_invited.get(v["sub_id"], {})
-                            if not inv_p.get("email"):
+                            if (not inv_p.get("email")
+                                    or inv_p.get("notify_bid_activity")
+                                    is False):
                                 continue
                             if new_status == "awarded":
                                 send_simple_email(
@@ -1307,10 +1318,14 @@ def screen_sub_inbox(profile):
         if not itb:
             continue
         itb = itb[0]
-        gc = (sb().table("profiles").select("company, email, last_seen")
+        gc = (sb().table("profiles")
+              .select("company, email, last_seen, notify_messages, "
+                      "notify_bid_activity")
               .eq("id", itb["gc_id"]).execute().data)
         gc_name = gc[0]["company"] if gc else "GC"
         gc_email = gc[0].get("email") if gc else None
+        gc_msg_ok = bool(gc) and gc[0].get("notify_messages") is not False
+        gc_bid_ok = bool(gc) and gc[0].get("notify_bid_activity") is not False
         gc_seen = gc[0].get("last_seen") if gc else None
         badge = BADGES.get(v["status"], v["status"])
 
@@ -1338,7 +1353,8 @@ def screen_sub_inbox(profile):
                        .eq("sub_id", st.session_state.user_id)
                        .order("created_at").execute().data)
             bid_thread(itb["id"], st.session_state.user_id, th_msgs,
-                       gc_name, gc_email, itb["project"], profile["company"])
+                       gc_name, gc_email if gc_msg_ok else None,
+                       itb["project"], profile["company"])
 
             # drawings via short-lived signed URLs (private bucket)
             fs = (sb().table("itb_files").select("path, filename")
@@ -1402,7 +1418,7 @@ def screen_sub_inbox(profile):
                         upload_bid_files(itb["id"], bid["id"], docs)
                         sb().table("itb_invites").update(
                             {"status": "responded"}).eq("id", v["id"]).execute()
-                        if gc_email:
+                        if gc_email and gc_bid_ok:
                             what = ("revised their bid" if new_rev > 1
                                     else "submitted a bid")
                             send_simple_email(
@@ -1515,7 +1531,7 @@ def screen_rfp_board(profile):
                    .eq("sub_id", st.session_state.user_id).execute().data}
     gc_rows = {p["id"]: p for p in
                sb().table("profiles")
-               .select("id, company, last_seen, email")
+               .select("id, company, last_seen, email, notify_bid_activity")
                .in_("id", list({r["gc_id"] for r in rfps})).execute().data}
     gc_names = {k: v["company"] for k, v in gc_rows.items()}
 
@@ -1578,8 +1594,9 @@ def screen_rfp_board(profile):
                         "sub_id": st.session_state.user_id,
                         "message": msg.strip() or None,
                     }).execute()
-                    gc_email = gc_rows.get(r["gc_id"], {}).get("email")
-                    if gc_email:
+                    _gcr = gc_rows.get(r["gc_id"], {})
+                    gc_email = _gcr.get("email")
+                    if gc_email and _gcr.get("notify_bid_activity") is not False:
                         msg_part = (f"<br><i>\"{msg.strip()}\"</i>"
                                     if msg.strip() else "")
                         send_simple_email(
@@ -1781,68 +1798,18 @@ def screen_my_profile(profile):
         f'{"GC" if profile["role"] == "gc" else profile.get("trade") or "Sub"} · '
         f'{profile.get("region") or ""} · CSLB {profile.get("license_no") or "—"}'
         f'</div></div>', unsafe_allow_html=True)
-    curr_opt = bool(profile.get("email_opt_out"))
-    new_opt = st.toggle("📧 Email me product updates & announcements",
-                        value=not curr_opt, key="email_updates_toggle")
-    if new_opt == curr_opt:   # toggle state differs from stored -> save
-        sb().table("profiles").update(
-            {"email_opt_out": not new_opt}).eq(
-            "id", st.session_state.user_id).execute()
-        st.session_state.profile = {**profile, "email_opt_out": not new_opt}
-        st.rerun()
-
-    with st.expander("Wrong role? Switch account type"):
-        other = "Subcontractor" if profile["role"] == "gc" else "General Contractor"
-        st.markdown(f'<div style="color:{C["inkSoft"]};font-size:14px">'
-                    f'Your account is set up as a '
-                    f'**{"General Contractor" if profile["role"] == "gc" else "Subcontractor"}**. '
-                    f'Switching changes which tools you see — your existing '
-                    f'data stays in the system.</div>',
-                    unsafe_allow_html=True)
-        sure = st.checkbox(f"I understand — switch me to {other}",
-                           key="role_switch_confirm")
-        if st.button(f"Switch to {other}", key="role_switch_btn"):
-            if sure:
-                switch_role(profile,
-                            "sub" if profile["role"] == "gc" else "gc")
-            else:
-                st.error("Tick the confirmation box first.")
-
-    if profile["role"] == "sub":
-        with st.expander("🛠 Trades & service area"):
-            cur_trades = [t for t in (profile.get("trades") or [])
-                          if t in TRADES]
-            cur_states = [x for x in (profile.get("work_states") or [])
-                          if x in US_STATES]
-            new_trades = st.multiselect("Trades (CSLB classifications)",
-                                        TRADES, default=cur_trades)
-            new_states = st.multiselect("States you work in", US_STATES,
-                                        default=cur_states or ["CA"])
-            new_cities = st.text_input(
-                "Cities / areas you serve",
-                value=profile.get("work_cities") or "",
-                placeholder="e.g. San Jose, Santa Clara, Gilroy")
-            if st.button("Save trades & service area"):
-                upd = {"trades": new_trades or None,
-                       "work_states": new_states or None,
-                       "work_cities": new_cities.strip() or None,
-                       "trade": ", ".join(new_trades) or None}
-                sb().table("profiles").update(upd).eq(
-                    "id", st.session_state.user_id).execute()
-                st.session_state.profile = {**profile, **upd}
-                st.success("Saved — GCs filtering by trade and location "
-                           "will now find you.")
-                st.rerun()
-
-    st.markdown(f'<div style="color:{C["inkSoft"]};margin-bottom:6px">Your '
-                f'portfolio is your evidence of excellence — every GC and sub '
-                f'on SLATE can see it. Add current and completed projects with '
-                f'photos.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="eyebrow" style="margin-top:10px">PORTFOLIO — '
+                'SHOWCASE YOUR WORK</div>', unsafe_allow_html=True)
+    st.markdown(f'<div style="color:{C["inkSoft"]};margin-bottom:6px">Photos '
+                f'and descriptions of jobs you\'ve built — past and current. '
+                f'This is what GCs and subs see when they vet you. '
+                f'(Looking for work to bid on? That\'s the RFP Board.)</div>',
+                unsafe_allow_html=True)
 
     if "show_add_project" not in st.session_state:
         st.session_state.show_add_project = False
     toggle_label = ("➖ Close" if st.session_state.show_add_project
-                    else "➕ Add a project")
+                    else "➕ Add work to your portfolio")
     if st.button(toggle_label, key="toggle_add_project"):
         st.session_state.show_add_project = not st.session_state.show_add_project
         st.rerun()
@@ -1895,7 +1862,8 @@ def screen_my_profile(profile):
                 .eq("owner_id", st.session_state.user_id)
                 .order("created_at", desc=True).execute().data)
     if not projects:
-        st.info("No projects yet — add your first one above.")
+        st.info("Nothing showcased yet — add photos of a job you've "
+                "built using the button above.")
         return
 
     for p in projects:
@@ -2046,13 +2014,20 @@ def screen_public_profile(uid):
 #  FEEDBACK WIDGET  (sidebar, all users) — lands in the admin inbox
 # ─────────────────────────────────────────────────────────────────────
 def feedback_widget():
-    with st.expander("💬 Send feedback"):
+    """Sidebar feedback — styled like a nav item, opens a clean inline
+    form. Submissions land in the admin Feedback Inbox."""
+    fb_open = st.session_state.get("fb_open", False)
+    if st.button("Feedback", key="nav_feedback",
+                 type="primary" if fb_open else "secondary"):
+        st.session_state.fb_open = not fb_open
+        st.rerun()
+    if fb_open:
         gen = st.session_state.get("fb_gen", 0)
-        msg = st.text_area("What's working? What's broken? What's missing?",
-                           key=f"fb_msg_{gen}", label_visibility="collapsed",
+        msg = st.text_area("Feedback", key=f"fb_msg_{gen}",
+                           label_visibility="collapsed", height=110,
                            placeholder="What's working? What's broken? "
                                        "What's missing?")
-        if st.button("Send to SLATE", key="fb_send"):
+        if st.button("Send", key="fb_send"):
             if not msg.strip():
                 st.error("Write something first.")
             else:
@@ -2061,7 +2036,8 @@ def feedback_widget():
                     "message": msg.strip(),
                 }).execute()
                 st.session_state.fb_gen = gen + 1
-                st.success("Sent — thank you. Every message gets read.")
+                st.session_state.fb_open = False
+                st.success("Sent — every message gets read.")
                 st.rerun()
 
 
@@ -2139,13 +2115,15 @@ def screen_admin_home(profile):
                         .in_("itb_id", list(due_itbs.keys()))
                         .eq("status", "sent").execute().data)
             sub_emails = {p["id"]: p for p in
-                          sb().table("profiles").select("id, email, company")
+                          sb().table("profiles")
+                          .select("id, email, company, notify_bid_activity")
                           .in_("id", list({v["sub_id"] for v in open_inv}))
                           .execute().data} if open_inv else {}
             for v in open_inv:
                 itb = due_itbs[v["itb_id"]]
                 sp = sub_emails.get(v["sub_id"], {})
-                if sp.get("email"):
+                if (sp.get("email")
+                        and sp.get("notify_bid_activity") is not False):
                     sent += send_simple_email(
                         sp["email"],
                         f"⏰ Bid due {itb['due_date']}: {itb['project']}",
@@ -2249,8 +2227,14 @@ def screen_admin_queue():
             f'Profile company: {p["company"]} · CSLB record: '
             f'{p.get("cslb_business") or "not parsed"} · '
             f'license {p.get("license_no") or "—"} · '
-            f'status: {p.get("cslb_status") or "—"}</div></div>',
-            unsafe_allow_html=True)
+            f'status: {p.get("cslb_status") or "—"}</div>'
+            + (f'<a href="https://www.cslb.ca.gov/OnlineServices/'
+               f'CheckLicenseII/LicenseDetail.aspx?LicNum='
+               f'{"".join(ch for ch in (p.get("license_no") or "") if ch.isdigit())}" '
+               f'target="_blank" class="f-mono" style="font-size:11px;'
+               f'color:{C["blue"]}">Check license on CSLB ↗</a>'
+               if p.get("license_no") else "")
+            + '</div>', unsafe_allow_html=True)
         c1, c2 = st.columns(2)
         if c1.button("Approve", key=f"vok_{p['id']}"):
             sb().table("profiles").update({
@@ -2428,6 +2412,142 @@ def screen_admin_announce(profile):
             st.success(f"Announcement sent: {ok} delivered, {fail} failed.")
 
 
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  SCREEN: SETTINGS  (account info, password, email preferences)
+# ─────────────────────────────────────────────────────────────────────
+def screen_settings(profile):
+    heading("SETTINGS")
+
+    # ── account info ──
+    st.markdown('<div class="eyebrow">ACCOUNT INFO</div>',
+                unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    nm = c1.text_input("Your name", value=profile.get("contact_name") or "")
+    co = c2.text_input("Company name", value=profile.get("company") or "")
+    c3, c4 = st.columns(2)
+    rg = c3.text_input("Region", value=profile.get("region") or "")
+    c4.text_input("Email (login)", value=profile.get("email") or "",
+                  disabled=True,
+                  help="Changing your login email requires re-confirmation — "
+                       "message SLATE via Feedback and we'll handle it.")
+    if st.button("Save account info"):
+        if not co.strip():
+            st.error("Company name is required.")
+        else:
+            upd = {"contact_name": nm.strip() or None,
+                   "company": co.strip(), "region": rg.strip() or None}
+            sb().table("profiles").update(upd).eq(
+                "id", st.session_state.user_id).execute()
+            st.session_state.profile = {**profile, **upd}
+            st.success("Saved.")
+            st.rerun()
+
+    # ── password ──
+    st.markdown('<div class="eyebrow" style="margin-top:14px">CHANGE '
+                'PASSWORD</div>', unsafe_allow_html=True)
+    p1, p2 = st.columns(2)
+    npw = p1.text_input("New password (8+ characters)", type="password",
+                        key="set_pw1")
+    npw2 = p2.text_input("Confirm new password", type="password",
+                         key="set_pw2")
+    if st.button("Update password"):
+        if len(npw) < 8:
+            st.error("Password needs at least 8 characters.")
+        elif npw != npw2:
+            st.error("Passwords don't match.")
+        else:
+            try:
+                r = requests.put(
+                    f"{st.secrets['SUPABASE_URL']}/auth/v1/user",
+                    headers={"apikey": st.secrets["SUPABASE_ANON_KEY"],
+                             "Authorization":
+                                 f"Bearer {st.session_state.access_token}"},
+                    json={"password": npw}, timeout=15)
+                if r.status_code == 200:
+                    st.success("Password updated.")
+                else:
+                    st.error("Couldn't update the password — try logging "
+                             "out and back in first.")
+            except requests.RequestException:
+                st.error("Network hiccup — try again.")
+
+    # ── email preferences ──
+    st.markdown('<div class="eyebrow" style="margin-top:14px">EMAIL '
+                'NOTIFICATIONS</div>', unsafe_allow_html=True)
+    st.markdown(f'<div style="color:{C["inkSoft"]};font-size:14px">'
+                f'Verification and document-review emails always send. '
+                f'Everything else is up to you.</div>',
+                unsafe_allow_html=True)
+    t_ann = st.toggle("Product updates & announcements",
+                      value=not bool(profile.get("email_opt_out")),
+                      key="pref_ann")
+    t_bid = st.toggle("Bid activity (new bids, awards, RFP matches, "
+                      "due-date reminders)",
+                      value=profile.get("notify_bid_activity", True) is not False,
+                      key="pref_bid")
+    t_msg = st.toggle("Bid Q&A messages",
+                      value=profile.get("notify_messages", True) is not False,
+                      key="pref_msg")
+    if st.button("Save notification settings"):
+        upd = {"email_opt_out": not t_ann,
+               "notify_bid_activity": t_bid,
+               "notify_messages": t_msg}
+        sb().table("profiles").update(upd).eq(
+            "id", st.session_state.user_id).execute()
+        st.session_state.profile = {**profile, **upd}
+        st.success("Notification settings saved.")
+        st.rerun()
+
+    st.markdown('<div class="eyebrow" style="margin-top:14px">ACCOUNT TYPE</div>', unsafe_allow_html=True)
+    with st.expander("Wrong role? Switch account type"):
+        other = "Subcontractor" if profile["role"] == "gc" else "General Contractor"
+        st.markdown(f'<div style="color:{C["inkSoft"]};font-size:14px">'
+                    f'Your account is set up as a '
+                    f'**{"General Contractor" if profile["role"] == "gc" else "Subcontractor"}**. '
+                    f'Switching changes which tools you see — your existing '
+                    f'data stays in the system.</div>',
+                    unsafe_allow_html=True)
+        sure = st.checkbox(f"I understand — switch me to {other}",
+                           key="role_switch_confirm")
+        if st.button(f"Switch to {other}", key="role_switch_btn"):
+            if sure:
+                switch_role(profile,
+                            "sub" if profile["role"] == "gc" else "gc")
+            else:
+                st.error("Tick the confirmation box first.")
+
+
+    st.markdown('<div class="eyebrow" style="margin-top:14px">TRADES & SERVICE AREA</div>', unsafe_allow_html=True)
+    if profile["role"] == "sub":
+        with st.expander("🛠 Trades & service area"):
+            cur_trades = [t for t in (profile.get("trades") or [])
+                          if t in TRADES]
+            cur_states = [x for x in (profile.get("work_states") or [])
+                          if x in US_STATES]
+            new_trades = st.multiselect("Trades (CSLB classifications)",
+                                        TRADES, default=cur_trades)
+            new_states = st.multiselect("States you work in", US_STATES,
+                                        default=cur_states or ["CA"])
+            new_cities = st.text_input(
+                "Cities / areas you serve",
+                value=profile.get("work_cities") or "",
+                placeholder="e.g. San Jose, Santa Clara, Gilroy")
+            if st.button("Save trades & service area"):
+                upd = {"trades": new_trades or None,
+                       "work_states": new_states or None,
+                       "work_cities": new_cities.strip() or None,
+                       "trade": ", ".join(new_trades) or None}
+                sb().table("profiles").update(upd).eq(
+                    "id", st.session_state.user_id).execute()
+                st.session_state.profile = {**profile, **upd}
+                st.success("Saved — GCs filtering by trade and location "
+                           "will now find you.")
+                st.rerun()
+
+
+
 # ─────────────────────────────────────────────────────────────────────
 #  MAIN ROUTER
 # ─────────────────────────────────────────────────────────────────────
@@ -2463,10 +2583,11 @@ with st.sidebar:
                      "Feedback Inbox", "Announcements"]
     elif profile["role"] == "gc":
         nav_items = ["My Profile", "Dashboard", "New Bid Request",
-                     "Bid Requests", "Sub Network", "Get Verified"]
+                     "Bid Requests", "Sub Network", "Get Verified",
+                     "Settings"]
     else:
         nav_items = ["My Profile", "Bid Invites", "RFP Board", "Find GCs",
-                     "Get Verified"]
+                     "Get Verified", "Settings"]
     if st.session_state.get("page") not in nav_items:
         st.session_state.page = nav_items[0]
     for item in nav_items:
@@ -2504,6 +2625,8 @@ elif page == "Get Verified":
     screen_verify(profile)
 elif page == "My Profile":
     screen_my_profile(profile)
+elif page == "Settings":
+    screen_settings(profile)
 elif profile["role"] == "gc":
     if page == "Dashboard":
         screen_gc_dashboard(profile)
