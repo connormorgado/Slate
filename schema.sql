@@ -24,7 +24,8 @@ create table if not exists profiles (
   verified_at   timestamptz,
   cslb_status   text,           -- raw status line from CSLB lookup
   cslb_expires  text,           -- license expiration
-  cslb_business text,           -- business name on the license
+  cslb_business text,
+  cslb_classes  text,   -- e.g. 'B, C-10'           -- business name on the license
   created_at  timestamptz default now()
 );
 

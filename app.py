@@ -454,6 +454,16 @@ def screen_onboarding():
     heading("SET UP YOUR PROFILE")
     contact = st.text_input("Your name", placeholder="First and last")
     role = st.radio("I am a…", ["General Contractor", "Subcontractor"], horizontal=True)
+    ROLE_DESC = {
+        "General Contractor": ("As a **General Contractor**, you'll POST "
+                               "bid requests (RFPs), invite subcontractors, "
+                               "and receive & award bids."),
+        "Subcontractor": ("As a **Subcontractor**, you'll BROWSE open RFPs, "
+                          "request to bid, and SUBMIT bids to general "
+                          "contractors."),
+    }
+    st.info(ROLE_DESC[role])
+    role_confirm = st.checkbox(f"Yes, that's me — I'm a {role.lower()}")
     company = st.text_input("Company name")
     trade, license_no, trades_sel, states_sel, cities = None, None, [], [], ""
     if role == "Subcontractor":
@@ -466,6 +476,10 @@ def screen_onboarding():
         trade = ", ".join(trades_sel) if trades_sel else None
     region = st.text_input("Region (e.g. South Bay)")
     if st.button("Save profile"):
+        if not role_confirm:
+            st.error(f"Please confirm the role description above — this "
+                     f"determines which tools you get.")
+            return
         if not company.strip():
             st.error("Company name is required.")
             return
@@ -669,6 +683,33 @@ def verification_banner(profile):
                    f"number.")
 
 
+def switch_role(profile, new_role):
+    """Self-serve role correction. Existing data (bids, RFPs,
+    portfolio) stays in the database; only the toolset changes."""
+    sb().table("profiles").update({"role": new_role}).eq(
+        "id", st.session_state.user_id).execute()
+    st.session_state.profile = {**profile, "role": new_role}
+    st.session_state.pop("page", None)
+    st.rerun()
+
+
+def role_mismatch_check(profile, classes):
+    """CSLB cross-check: a 'GC' whose license is only C-class
+    specialty work is very likely a subcontractor who mis-clicked."""
+    if not classes:
+        return
+    has_general = any(c in ("A", "B") for c in classes)
+    if profile["role"] == "gc" and not has_general:
+        st.warning(f"⚠️ Your license shows specialty classification"
+                   f"{'s' if len(classes) > 1 else ''} "
+                   f"**{', '.join(classes)}** — general contractors "
+                   f"typically hold a B (General Building). Did you mean "
+                   f"to sign up as a **Subcontractor**?")
+        if st.button("Yes — switch my account to Subcontractor",
+                     key="fix_role_sub"):
+            switch_role(profile, "sub")
+
+
 def apply_verification(result, license_no, profile):
     """Hybrid decision: clean active-license + name match -> verified;
     anything else that looked like a real license -> pending review."""
@@ -677,6 +718,7 @@ def apply_verification(result, license_no, profile):
         "cslb_status": result.get("status"),
         "cslb_expires": result.get("expires"),
         "cslb_business": result.get("business"),
+        "cslb_classes": ", ".join(result.get("classes") or []) or None,
     }
     if (result.get("active") and result.get("business")
             and name_match(profile["company"], result["business"])):
@@ -766,8 +808,13 @@ def screen_verify(profile):
             f'<div style="color:{C["ink"]}">'
             f'{profile.get("cslb_business") or profile.get("company")}<br>'
             f'Status: {profile.get("cslb_status") or "—"}<br>'
+            f'Classifications: {profile.get("cslb_classes") or "—"}<br>'
             f'Expires: {profile.get("cslb_expires") or "—"}</div></div>',
             unsafe_allow_html=True)
+        role_mismatch_check(
+            profile, [c.strip() for c in
+                      (profile.get("cslb_classes") or "").split(",")
+                      if c.strip()])
         render_docs_section(profile)
         return
 
@@ -806,6 +853,7 @@ def screen_verify(profile):
                 st.rerun()
             return
         outcome = apply_verification(result, lic.strip(), profile)
+        role_mismatch_check(st.session_state.profile, result.get("classes"))
         if outcome == "verified":
             st.success("✓ Verified! Your license is current and active and "
                        "matches your company. You're unlocked.")
@@ -975,6 +1023,13 @@ def screen_gc_dashboard(profile):
             .order("created_at", desc=True).execute().data)
     if not itbs:
         st.info("No bid requests yet — create your first one from **New Bid Request**.")
+        st.markdown(f'<div class="f-mono" style="font-size:11px;'
+                    f'color:{C["inkSoft"]}">Looking to BID ON work instead '
+                    f'of posting it? You may have picked the wrong role at '
+                    f'signup.</div>', unsafe_allow_html=True)
+        if st.button("I'm actually a Subcontractor — switch my role",
+                     key="dash_role_fix"):
+            switch_role(profile, "sub")
         return
 
     # ── money + activity summary across all my RFPs ──
@@ -1610,6 +1665,23 @@ def screen_my_profile(profile):
         f'{"GC" if profile["role"] == "gc" else profile.get("trade") or "Sub"} · '
         f'{profile.get("region") or ""} · CSLB {profile.get("license_no") or "—"}'
         f'</div></div>', unsafe_allow_html=True)
+    with st.expander("Wrong role? Switch account type"):
+        other = "Subcontractor" if profile["role"] == "gc" else "General Contractor"
+        st.markdown(f'<div style="color:{C["inkSoft"]};font-size:14px">'
+                    f'Your account is set up as a '
+                    f'**{"General Contractor" if profile["role"] == "gc" else "Subcontractor"}**. '
+                    f'Switching changes which tools you see — your existing '
+                    f'data stays in the system.</div>',
+                    unsafe_allow_html=True)
+        sure = st.checkbox(f"I understand — switch me to {other}",
+                           key="role_switch_confirm")
+        if st.button(f"Switch to {other}", key="role_switch_btn"):
+            if sure:
+                switch_role(profile,
+                            "sub" if profile["role"] == "gc" else "gc")
+            else:
+                st.error("Tick the confirmation box first.")
+
     if profile["role"] == "sub":
         with st.expander("🛠 Trades & service area"):
             cur_trades = [t for t in (profile.get("trades") or [])
@@ -1955,9 +2027,17 @@ def screen_admin_users():
             f'{r.get("region") or "—"} · CSLB {r.get("license_no") or "—"} · '
             f'status: {r["verification_status"]}</div></div>',
             unsafe_allow_html=True)
-        if st.button("View profile", key=f"adminprof_{r['id']}"):
+        ac1, ac2 = st.columns([1, 3])
+        if ac1.button("View profile", key=f"adminprof_{r['id']}"):
             st.session_state.view_profile = r["id"]
             st.rerun()
+        if r["role"] in ("gc", "sub"):
+            other = "sub" if r["role"] == "gc" else "gc"
+            if ac2.button(f"Fix role → {other.upper()}",
+                          key=f"adminrole_{r['id']}"):
+                sb().table("profiles").update({"role": other}).eq(
+                    "id", r["id"]).execute()
+                st.rerun()
 
 
 def screen_admin_rfps():

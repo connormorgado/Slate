@@ -75,8 +75,17 @@ def check_license(license_no, timeout=15):
             business = m_biz.group(1).strip()
             break
 
+    # License classifications (e.g. "B - GENERAL BUILDING",
+    # "C10 - ELECTRICAL"). Used to sanity-check the chosen SLATE role:
+    # only C-class specialties on a "GC" account suggests a sub.
+    classes = []
+    for m in re.finditer(r"\b([ABC])-?(\d{1,2})?\s*[-–—]\s*[A-Za-z]", text):
+        c = m.group(1) + (f"-{m.group(2)}" if m.group(2) else "")
+        if c not in classes:
+            classes.append(c)
+
     return {"ok": True, "active": active, "status": status,
-            "business": business,
+            "business": business, "classes": classes,
             "expires": m_exp.group(1) if m_exp else None, "url": url}
 
 
