@@ -11,6 +11,7 @@ create table if not exists profiles (
   email       text not null,
   contact_name text,
   last_seen   timestamptz,
+  email_opt_out boolean not null default false,
   role        text not null check (role in ('gc', 'sub', 'admin')),
   company     text not null,
   trade       text,

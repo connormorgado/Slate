@@ -333,6 +333,30 @@ def send_itb_email(to_email, gc_company, project, trade, due, app_url):
         return False, str(e)
 
 
+def email_html(title, body_html, cta_label=None, cta_url=None):
+    """Consistent branded wrapper for all SLATE notification emails."""
+    cta = ""
+    if cta_label:
+        url = cta_url or st.secrets.get("APP_URL",
+                                        "https://slate-bids.streamlit.app")
+        cta = (f"<p style='margin-top:18px'><a href='{url}' "
+               f"style='background:#1D7A44;color:#fff;padding:12px 22px;"
+               f"border-radius:4px;text-decoration:none;font-weight:600'>"
+               f"{cta_label}</a></p>")
+    return (f"<div style='font-family:Arial,sans-serif;max-width:560px'>"
+            f"<div style='background:#0D0F0E;padding:14px 20px;"
+            f"border-radius:6px 6px 0 0'><span style='color:#6EE86E;"
+            f"font-weight:800;letter-spacing:3px;font-size:18px'>SLATE."
+            f"</span></div>"
+            f"<div style='border:1px solid #C6CCC4;border-top:none;"
+            f"padding:22px 20px;border-radius:0 0 6px 6px'>"
+            f"<h2 style='margin:0 0 10px 0;color:#141B17'>{title}</h2>"
+            f"<div style='color:#3D4E63;font-size:15px;line-height:1.5'>"
+            f"{body_html}</div>{cta}"
+            f"<p style='color:#8FA394;font-size:11px;margin-top:22px'>"
+            f"SLATE — by contractors, for contractors.</p></div></div>")
+
+
 def send_simple_email(to_email, subject, html):
     """Generic notification email — degrades gracefully with no key."""
     api_key = st.secrets.get("RESEND_API_KEY")
@@ -724,6 +748,12 @@ def apply_verification(result, license_no, profile):
             and name_match(profile["company"], result["business"])):
         update["verification_status"] = "verified"
         update["verified_at"] = datetime.now(timezone.utc).isoformat()
+        send_simple_email(
+            st.session_state.user_email, "You're verified on SLATE ✓",
+            email_html("You're verified!",
+                       f"Your CSLB license checked out — "
+                       f"<b>{profile['company']}</b> is now fully unlocked "
+                       f"on SLATE.", "Open SLATE"))
     else:
         update["verification_status"] = "pending"
     sb().table("profiles").update(update).eq(
@@ -1001,9 +1031,32 @@ def screen_new_itb(profile):
                 emailed += ok
                 failed += (not ok)
 
+        notified = 0
+        if visibility in ("public", "both"):
+            for sm in subs:
+                trade_ok = (not trades_needed
+                            or (sm.get("trades")
+                                and set(trades_needed) & set(sm["trades"])))
+                state_ok = (sm.get("work_states")
+                            and r_state in sm["work_states"])
+                already = any(p2["id"] == sm["id"] for p2 in picked)
+                if trade_ok and state_ok and not already and sm.get("email"):
+                    ok = send_simple_email(
+                        sm["email"],
+                        f"New RFP in your area: {project.strip()}",
+                        email_html(
+                            "New work on the board",
+                            f"<b>{profile['company']}</b> posted "
+                            f"<b>{project.strip()} — {trade}</b> in "
+                            f"{location}. It matches your trades and "
+                            f"service area — request to bid before "
+                            f"{due.isoformat()}.", "View the RFP"))
+                    notified += ok
+
         bits = []
         if visibility in ("public", "both"):
-            bits.append("posted to the public RFP board")
+            bits.append(f"posted to the public RFP board "
+                        f"({notified} matching subs notified)")
         if picked:
             bits.append(f"sent to {len(picked)} invited sub(s), "
                         f"{emailed} email(s) delivered")
@@ -1162,6 +1215,12 @@ def screen_gc_dashboard(profile):
                 if not awarded and invite:
                     if st.button(f"Award to {sub_name}",
                                  key=f"award_{itb['id']}_{b['sub_id']}"):
+                        all_invited = {p["id"]: p for p in
+                                       sb().table("profiles")
+                                       .select("id, company, email")
+                                       .in_("id", [v["sub_id"]
+                                                   for v in invites])
+                                       .execute().data}
                         for v in invites:
                             if v["sub_id"] == b["sub_id"]:
                                 new_status = "awarded"
@@ -1171,6 +1230,35 @@ def screen_gc_dashboard(profile):
                                 new_status = v["status"]
                             sb().table("itb_invites").update(
                                 {"status": new_status}).eq("id", v["id"]).execute()
+                            inv_p = all_invited.get(v["sub_id"], {})
+                            if not inv_p.get("email"):
+                                continue
+                            if new_status == "awarded":
+                                send_simple_email(
+                                    inv_p["email"],
+                                    f"🏆 Awarded: {itb['project']}",
+                                    email_html(
+                                        "You won the scope!",
+                                        f"<b>{profile['company']}</b> awarded "
+                                        f"you <b>{itb['project']} — "
+                                        f"{itb['trade']}</b>. Your verified "
+                                        f"documents are now visible to the "
+                                        f"GC, who will follow up on contract "
+                                        f"next steps.", "Open SLATE"))
+                            elif new_status == "not_selected" and \
+                                    v["status"] == "responded":
+                                send_simple_email(
+                                    inv_p["email"],
+                                    f"Bid decision: {itb['project']}",
+                                    email_html(
+                                        "This one went to another sub",
+                                        f"<b>{itb['project']} — "
+                                        f"{itb['trade']}</b> was awarded to "
+                                        f"another bidder. Thanks for the "
+                                        f"number — your response record on "
+                                        f"SLATE still counts, and there's "
+                                        f"more work on the board.",
+                                        "Browse open RFPs"))
                         st.rerun()
 
 
@@ -1314,6 +1402,21 @@ def screen_sub_inbox(profile):
                         upload_bid_files(itb["id"], bid["id"], docs)
                         sb().table("itb_invites").update(
                             {"status": "responded"}).eq("id", v["id"]).execute()
+                        if gc_email:
+                            what = ("revised their bid" if new_rev > 1
+                                    else "submitted a bid")
+                            send_simple_email(
+                                gc_email,
+                                f"{'Revised' if new_rev > 1 else 'New'} bid: "
+                                f"{itb['project']}",
+                                email_html(
+                                    f"{profile['company']} {what}",
+                                    f"<b>${amount:,.0f}</b> on "
+                                    f"<b>{itb['project']} — {itb['trade']}"
+                                    f"</b>"
+                                    + (f" (revision {new_rev})"
+                                       if new_rev > 1 else "")
+                                    + ".", "Review bids"))
                         st.success(f"Bid submitted (revision {new_rev}).")
                         st.rerun()
 
@@ -1411,7 +1514,8 @@ def screen_rfp_board(profile):
                    sb().table("bid_requests").select("itb_id, status")
                    .eq("sub_id", st.session_state.user_id).execute().data}
     gc_rows = {p["id"]: p for p in
-               sb().table("profiles").select("id, company, last_seen")
+               sb().table("profiles")
+               .select("id, company, last_seen, email")
                .in_("id", list({r["gc_id"] for r in rfps})).execute().data}
     gc_names = {k: v["company"] for k, v in gc_rows.items()}
 
@@ -1474,6 +1578,18 @@ def screen_rfp_board(profile):
                         "sub_id": st.session_state.user_id,
                         "message": msg.strip() or None,
                     }).execute()
+                    gc_email = gc_rows.get(r["gc_id"], {}).get("email")
+                    if gc_email:
+                        msg_part = (f"<br><i>\"{msg.strip()}\"</i>"
+                                    if msg.strip() else "")
+                        send_simple_email(
+                            gc_email,
+                            f"Bid request: {r['project']}",
+                            email_html(
+                                f"{profile['company']} wants to bid",
+                                f"A verified sub requested permission to bid "
+                                f"on <b>{r['project']} — {r['trade']}</b>."
+                                f"{msg_part}", "Review the request"))
                     st.success("Request sent — the GC will approve or decline.")
                     st.rerun()
 
@@ -1665,6 +1781,16 @@ def screen_my_profile(profile):
         f'{"GC" if profile["role"] == "gc" else profile.get("trade") or "Sub"} · '
         f'{profile.get("region") or ""} · CSLB {profile.get("license_no") or "—"}'
         f'</div></div>', unsafe_allow_html=True)
+    curr_opt = bool(profile.get("email_opt_out"))
+    new_opt = st.toggle("📧 Email me product updates & announcements",
+                        value=not curr_opt, key="email_updates_toggle")
+    if new_opt == curr_opt:   # toggle state differs from stored -> save
+        sb().table("profiles").update(
+            {"email_opt_out": not new_opt}).eq(
+            "id", st.session_state.user_id).execute()
+        st.session_state.profile = {**profile, "email_opt_out": not new_opt}
+        st.rerun()
+
     with st.expander("Wrong role? Switch account type"):
         other = "Subcontractor" if profile["role"] == "gc" else "General Contractor"
         st.markdown(f'<div style="color:{C["inkSoft"]};font-size:14px">'
@@ -1997,6 +2123,39 @@ def screen_admin_home(profile):
                 f'color:{C["inkSoft"]}">Activity counts from when tracking '
                 f'went live — accounts never seen since then count as '
                 f'inactive.</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="eyebrow" style="margin-top:14px">NUDGES</div>',
+                unsafe_allow_html=True)
+    if st.button("📣 Email reminders for bids due within 3 days"):
+        today, cutoff = date.today(), date.today() + timedelta(days=3)
+        due_itbs = {i["id"]: i for i in
+                    sb().table("itbs").select("id, project, trade, due_date")
+                    .execute().data
+                    if i.get("due_date")
+                    and today <= date.fromisoformat(i["due_date"]) <= cutoff}
+        sent = 0
+        if due_itbs:
+            open_inv = (sb().table("itb_invites").select("itb_id, sub_id")
+                        .in_("itb_id", list(due_itbs.keys()))
+                        .eq("status", "sent").execute().data)
+            sub_emails = {p["id"]: p for p in
+                          sb().table("profiles").select("id, email, company")
+                          .in_("id", list({v["sub_id"] for v in open_inv}))
+                          .execute().data} if open_inv else {}
+            for v in open_inv:
+                itb = due_itbs[v["itb_id"]]
+                sp = sub_emails.get(v["sub_id"], {})
+                if sp.get("email"):
+                    sent += send_simple_email(
+                        sp["email"],
+                        f"⏰ Bid due {itb['due_date']}: {itb['project']}",
+                        email_html(
+                            "The ball's in your court",
+                            f"Your bid on <b>{itb['project']} — "
+                            f"{itb['trade']}</b> is due "
+                            f"<b>{itb['due_date']}</b> and you haven't "
+                            f"responded yet.", "Submit your bid"))
+        st.success(f"Reminders sent: {sent}.")
     st.markdown(f'<div class="f-mono" style="font-size:11px;'
                 f'color:{C["inkSoft"]}">Pending items live in the '
                 f'Verification Queue and Feedback Inbox.</div>',
@@ -2098,6 +2257,13 @@ def screen_admin_queue():
                 "verification_status": "verified",
                 "verified_at": datetime.now(timezone.utc).isoformat(),
             }).eq("id", p["id"]).execute()
+            if p.get("email"):
+                send_simple_email(
+                    p["email"], "You're verified on SLATE ✓",
+                    email_html("You're verified!",
+                               f"Your license review is complete — "
+                               f"<b>{p['company']}</b> is now fully "
+                               f"unlocked on SLATE.", "Open SLATE"))
             st.rerun()
         if c2.button("Reject", key=f"vno_{p['id']}"):
             sb().table("profiles").update(
@@ -2140,6 +2306,16 @@ def screen_admin_queue():
                 "status": "approved",
                 "reviewed_at": datetime.now(timezone.utc).isoformat(),
             }).eq("id", d["id"]).execute()
+            owner_email = (sb().table("profiles").select("email")
+                           .eq("id", d["user_id"]).execute().data)
+            if owner_email:
+                send_simple_email(
+                    owner_email[0]["email"],
+                    f"Document approved: {d['doc_type']}",
+                    email_html("Document approved ✓",
+                               f"Your <b>{d['doc_type']}</b> was reviewed "
+                               f"and approved. The ✓ badge now shows on "
+                               f"your public profile.", "View your profile"))
             st.rerun()
         rej_note = c3.text_input("Rejection note (optional)",
                                  key=f"dnote_{d['id']}",
@@ -2151,6 +2327,19 @@ def screen_admin_queue():
                 "note": rej_note.strip() or None,
                 "reviewed_at": datetime.now(timezone.utc).isoformat(),
             }).eq("id", d["id"]).execute()
+            owner_email = (sb().table("profiles").select("email")
+                           .eq("id", d["user_id"]).execute().data)
+            if owner_email:
+                note_txt = (f"<br><i>Reviewer note: {rej_note.strip()}</i>"
+                            if rej_note.strip() else "")
+                send_simple_email(
+                    owner_email[0]["email"],
+                    f"Document needs attention: {d['doc_type']}",
+                    email_html("Document not approved",
+                               f"Your <b>{d['doc_type']}</b> couldn't be "
+                               f"approved as submitted.{note_txt}<br>"
+                               f"Re-upload a corrected version under "
+                               f"Get Verified.", "Re-upload in SLATE"))
             st.rerun()
 
 
@@ -2190,6 +2379,55 @@ def screen_admin_feedback():
                     st.rerun()
 
 
+def screen_admin_announce(profile):
+    heading("ANNOUNCEMENTS")
+    st.markdown(f'<div style="color:{C["inkSoft"]};margin-bottom:8px">Send '
+                f'a product update to every SLATE user (minus anyone who '
+                f'opted out on their profile). Keep it short and exciting — '
+                f'what changed, why they should care.</div>',
+                unsafe_allow_html=True)
+    gen = st.session_state.get("ann_gen", 0)
+    subj = st.text_input("Subject", key=f"ann_s_{gen}",
+                         placeholder="SLATE V2.4: Bid Q&A is live")
+    body = st.text_area("Message (blank line = new paragraph)",
+                        key=f"ann_b_{gen}", height=220)
+    with st.expander("Preview"):
+        paras = "".join(f"<p>{p.strip()}</p>"
+                        for p in body.split("\n\n") if p.strip())
+        st.markdown(email_html(subj or "Subject", paras or "<p>…</p>",
+                               "Open SLATE"), unsafe_allow_html=True)
+    recipients = (sb().table("profiles").select("email, email_opt_out, role")
+                  .neq("role", "admin").execute().data)
+    to_send = [r["email"] for r in recipients
+               if r.get("email") and not r.get("email_opt_out")]
+    st.markdown(f'<div class="f-mono" style="font-size:11px;'
+                f'color:{C["inkSoft"]}">Will send to {len(to_send)} user(s) '
+                f'({len(recipients) - len(to_send)} opted out or no email). '
+                f'Heads up: Resend free tier caps at 100 emails/day.</div>',
+                unsafe_allow_html=True)
+    confirm = st.checkbox("I've previewed this and I'm ready to send",
+                          key=f"ann_c_{gen}")
+    if st.button("Send announcement"):
+        if not (subj.strip() and body.strip()):
+            st.error("Subject and message are both required.")
+        elif not confirm:
+            st.error("Tick the confirmation box after previewing.")
+        else:
+            paras = "".join(f"<p>{p.strip()}</p>"
+                            for p in body.split("\n\n") if p.strip())
+            ok = fail = 0
+            with st.spinner(f"Sending to {len(to_send)} users…"):
+                for em in to_send:
+                    if send_simple_email(em, subj.strip(),
+                                         email_html(subj.strip(), paras,
+                                                    "Open SLATE")):
+                        ok += 1
+                    else:
+                        fail += 1
+            st.session_state.ann_gen = gen + 1
+            st.success(f"Announcement sent: {ok} delivered, {fail} failed.")
+
+
 # ─────────────────────────────────────────────────────────────────────
 #  MAIN ROUTER
 # ─────────────────────────────────────────────────────────────────────
@@ -2222,7 +2460,7 @@ with st.sidebar:
     st.markdown("<br>", unsafe_allow_html=True)
     if profile["role"] == "admin":
         nav_items = ["Admin Home", "Users", "All RFPs", "Verification Queue",
-                     "Feedback Inbox"]
+                     "Feedback Inbox", "Announcements"]
     elif profile["role"] == "gc":
         nav_items = ["My Profile", "Dashboard", "New Bid Request",
                      "Bid Requests", "Sub Network", "Get Verified"]
@@ -2258,6 +2496,8 @@ elif profile["role"] == "admin":
         screen_admin_rfps()
     elif page == "Verification Queue":
         screen_admin_queue()
+    elif page == "Announcements":
+        screen_admin_announce(profile)
     else:
         screen_admin_feedback()
 elif page == "Get Verified":
