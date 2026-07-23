@@ -82,6 +82,13 @@ DOC_TYPES = ["Certificate of Insurance (COI)",
              "Business License"]
 
 
+def safe_filename(name):
+    """Storage keys reject brackets, spaces, parens, etc. — replace
+    anything unsafe so uploads never fail on a filename."""
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name or "file")
+    return name.strip("._") or "file"
+
+
 def photo_to_jpeg(uploaded, max_px=1600):
     """Convert any uploaded photo (including iPhone HEIC) to a
     web-friendly JPEG, resized for fast profile loads.
@@ -646,7 +653,7 @@ def signed_link(path):
 def upload_bid_files(itb_id, bid_id, files):
     """Store a sub's bid documents and record them against the bid."""
     for f in files or []:
-        path = f"bids/{itb_id}/{bid_id}/{int(time.time())}_{f.name}"
+        path = f"bids/{itb_id}/{bid_id}/{int(time.time())}_{safe_filename(f.name)}"
         mime = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
         sb().storage.from_("drawings").upload(path, f.getvalue(),
                                               {"content-type": mime})
@@ -810,7 +817,7 @@ def render_docs_section(profile):
             if up is not None and st.button(f"Submit {dt.split(' (')[0]}",
                                             key=f"docbtn_{i}"):
                 path = (f"{st.session_state.user_id}/"
-                        f"{int(time.time())}_{up.name}")
+                        f"{int(time.time())}_{safe_filename(up.name)}")
                 mime = mimetypes.guess_type(up.name)[0] or "application/pdf"
                 sb().storage.from_("docs").upload(
                     path, up.getvalue(), {"content-type": mime})
@@ -1013,7 +1020,7 @@ def screen_new_itb(profile):
 
             # 2. upload files to the private bucket, record paths
             for f in files or []:
-                path = f"{itb['id']}/{int(time.time())}_{f.name}"
+                path = f"{itb['id']}/{int(time.time())}_{safe_filename(f.name)}"
                 mime = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
                 sb().storage.from_("drawings").upload(
                     path, f.getvalue(), {"content-type": mime})
@@ -1844,7 +1851,8 @@ def screen_my_profile(profile):
                 for ph in pphotos or []:
                     data, fname = photo_to_jpeg(ph)
                     path = (f"portfolio/{st.session_state.user_id}/"
-                            f"{proj['id']}/{int(time.time())}_{fname}")
+                            f"{proj['id']}/{int(time.time())}_"
+                            f"{safe_filename(fname)}")
                     mime = mimetypes.guess_type(fname)[0] or "image/jpeg"
                     sb().storage.from_("drawings").upload(
                         path, data, {"content-type": mime})
@@ -1922,7 +1930,8 @@ def screen_my_profile(profile):
                     for up in ups:
                         data, fname = photo_to_jpeg(up)
                         path = (f"portfolio/{st.session_state.user_id}/"
-                                f"{p['id']}/{int(time.time())}_{fname}")
+                                f"{p['id']}/{int(time.time())}_"
+                                f"{safe_filename(fname)}")
                         mime = mimetypes.guess_type(fname)[0] or "image/jpeg"
                         sb().storage.from_("drawings").upload(
                             path, data, {"content-type": mime})
@@ -2410,9 +2419,9 @@ def screen_admin_announce(profile):
     # host the images so email clients can render them
     if imgs and st.session_state.get("ann_img_sig") != [f.name for f in imgs]:
         urls = []
-        for f in imgs:
+        for i, f in enumerate(imgs, start=1):
             data, fname = photo_to_jpeg(f, max_px=1100)
-            path = f"{int(time.time())}_{fname}"
+            path = f"ann_{int(time.time())}_{i}.jpg"
             sb().storage.from_("announce").upload(
                 path, data, {"content-type": "image/jpeg"})
             pub = sb().storage.from_("announce").get_public_url(path)
