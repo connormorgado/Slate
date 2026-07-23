@@ -2363,23 +2363,80 @@ def screen_admin_feedback():
                     st.rerun()
 
 
+def _announce_body_html(body, image_urls):
+    """Paragraphs on blank lines, line breaks preserved, [imageN] tokens
+    swapped for hosted images (leftover images append at the end)."""
+    used = set()
+    paras = []
+    for p in body.split("\n\n"):
+        if not p.strip():
+            continue
+        chunk = p.strip().replace("\n", "<br>")
+        for i, url in enumerate(image_urls, start=1):
+            token = f"[image{i}]"
+            if token in chunk:
+                chunk = chunk.replace(
+                    token, f'<img src="{url}" width="100%" '
+                           f'style="border-radius:6px;border:1px solid '
+                           f'#C6CCC4;margin:8px 0">')
+                used.add(i)
+        paras.append(f"<p>{chunk}</p>")
+    for i, url in enumerate(image_urls, start=1):
+        if i not in used:
+            paras.append(f'<p><img src="{url}" width="100%" '
+                         f'style="border-radius:6px;border:1px solid '
+                         f'#C6CCC4;margin:8px 0"></p>')
+    return "".join(paras)
+
+
 def screen_admin_announce(profile):
     heading("ANNOUNCEMENTS")
     st.markdown(f'<div style="color:{C["inkSoft"]};margin-bottom:8px">Send '
-                f'a product update to every SLATE user (minus anyone who '
-                f'opted out on their profile). Keep it short and exciting — '
-                f'what changed, why they should care.</div>',
-                unsafe_allow_html=True)
+                f'a product update to every SLATE user (minus opt-outs). '
+                f'Upload screenshots below and place them in your text with '
+                f'<b>[image1]</b>, <b>[image2]</b>… — images without a token '
+                f'are added at the end.</div>', unsafe_allow_html=True)
+
     gen = st.session_state.get("ann_gen", 0)
     subj = st.text_input("Subject", key=f"ann_s_{gen}",
                          placeholder="SLATE V2.4: Bid Q&A is live")
-    body = st.text_area("Message (blank line = new paragraph)",
+    body = st.text_area("Message (blank line = new paragraph, "
+                        "[image1] places the first screenshot)",
                         key=f"ann_b_{gen}", height=220)
+    imgs = st.file_uploader("Screenshots (PNG/JPG — order matters: first "
+                            "file = [image1])", accept_multiple_files=True,
+                            key=f"ann_i_{gen}")
+
+    # host the images so email clients can render them
+    if imgs and st.session_state.get("ann_img_sig") != [f.name for f in imgs]:
+        urls = []
+        for f in imgs:
+            data, fname = photo_to_jpeg(f, max_px=1100)
+            path = f"{int(time.time())}_{fname}"
+            sb().storage.from_("announce").upload(
+                path, data, {"content-type": "image/jpeg"})
+            pub = sb().storage.from_("announce").get_public_url(path)
+            urls.append(pub if isinstance(pub, str)
+                        else pub.get("publicUrl") or pub.get("public_url"))
+        st.session_state.ann_img_urls = urls
+        st.session_state.ann_img_sig = [f.name for f in imgs]
+    if not imgs:
+        st.session_state.ann_img_urls = []
+        st.session_state.ann_img_sig = None
+    image_urls = st.session_state.get("ann_img_urls", [])
+    if image_urls:
+        st.markdown(f'<div class="f-mono" style="font-size:11px;'
+                    f'color:{C["green"]}">✓ {len(image_urls)} image(s) '
+                    f'hosted and ready — reference with '
+                    f'{", ".join(f"[image{i+1}]" for i in range(len(image_urls)))}'
+                    f'</div>', unsafe_allow_html=True)
+
     with st.expander("Preview"):
-        paras = "".join(f"<p>{p.strip()}</p>"
-                        for p in body.split("\n\n") if p.strip())
-        st.markdown(email_html(subj or "Subject", paras or "<p>…</p>",
-                               "Open SLATE"), unsafe_allow_html=True)
+        st.markdown(email_html(subj or "Subject",
+                               _announce_body_html(body, image_urls)
+                               or "<p>…</p>", "Open SLATE"),
+                    unsafe_allow_html=True)
+
     recipients = (sb().table("profiles").select("email, email_opt_out, role")
                   .neq("role", "admin").execute().data)
     to_send = [r["email"] for r in recipients
@@ -2397,155 +2454,20 @@ def screen_admin_announce(profile):
         elif not confirm:
             st.error("Tick the confirmation box after previewing.")
         else:
-            paras = "".join(f"<p>{p.strip()}</p>"
-                            for p in body.split("\n\n") if p.strip())
+            html_body = _announce_body_html(body, image_urls)
             ok = fail = 0
             with st.spinner(f"Sending to {len(to_send)} users…"):
                 for em in to_send:
                     if send_simple_email(em, subj.strip(),
-                                         email_html(subj.strip(), paras,
+                                         email_html(subj.strip(), html_body,
                                                     "Open SLATE")):
                         ok += 1
                     else:
                         fail += 1
             st.session_state.ann_gen = gen + 1
+            st.session_state.ann_img_urls = []
+            st.session_state.ann_img_sig = None
             st.success(f"Announcement sent: {ok} delivered, {fail} failed.")
-
-
-
-
-# ─────────────────────────────────────────────────────────────────────
-#  SCREEN: SETTINGS  (account info, password, email preferences)
-# ─────────────────────────────────────────────────────────────────────
-def screen_settings(profile):
-    heading("SETTINGS")
-
-    # ── account info ──
-    st.markdown('<div class="eyebrow">ACCOUNT INFO</div>',
-                unsafe_allow_html=True)
-    c1, c2 = st.columns(2)
-    nm = c1.text_input("Your name", value=profile.get("contact_name") or "")
-    co = c2.text_input("Company name", value=profile.get("company") or "")
-    c3, c4 = st.columns(2)
-    rg = c3.text_input("Region", value=profile.get("region") or "")
-    c4.text_input("Email (login)", value=profile.get("email") or "",
-                  disabled=True,
-                  help="Changing your login email requires re-confirmation — "
-                       "message SLATE via Feedback and we'll handle it.")
-    if st.button("Save account info"):
-        if not co.strip():
-            st.error("Company name is required.")
-        else:
-            upd = {"contact_name": nm.strip() or None,
-                   "company": co.strip(), "region": rg.strip() or None}
-            sb().table("profiles").update(upd).eq(
-                "id", st.session_state.user_id).execute()
-            st.session_state.profile = {**profile, **upd}
-            st.success("Saved.")
-            st.rerun()
-
-    # ── password ──
-    st.markdown('<div class="eyebrow" style="margin-top:14px">CHANGE '
-                'PASSWORD</div>', unsafe_allow_html=True)
-    p1, p2 = st.columns(2)
-    npw = p1.text_input("New password (8+ characters)", type="password",
-                        key="set_pw1")
-    npw2 = p2.text_input("Confirm new password", type="password",
-                         key="set_pw2")
-    if st.button("Update password"):
-        if len(npw) < 8:
-            st.error("Password needs at least 8 characters.")
-        elif npw != npw2:
-            st.error("Passwords don't match.")
-        else:
-            try:
-                r = requests.put(
-                    f"{st.secrets['SUPABASE_URL']}/auth/v1/user",
-                    headers={"apikey": st.secrets["SUPABASE_ANON_KEY"],
-                             "Authorization":
-                                 f"Bearer {st.session_state.access_token}"},
-                    json={"password": npw}, timeout=15)
-                if r.status_code == 200:
-                    st.success("Password updated.")
-                else:
-                    st.error("Couldn't update the password — try logging "
-                             "out and back in first.")
-            except requests.RequestException:
-                st.error("Network hiccup — try again.")
-
-    # ── email preferences ──
-    st.markdown('<div class="eyebrow" style="margin-top:14px">EMAIL '
-                'NOTIFICATIONS</div>', unsafe_allow_html=True)
-    st.markdown(f'<div style="color:{C["inkSoft"]};font-size:14px">'
-                f'Verification and document-review emails always send. '
-                f'Everything else is up to you.</div>',
-                unsafe_allow_html=True)
-    t_ann = st.toggle("Product updates & announcements",
-                      value=not bool(profile.get("email_opt_out")),
-                      key="pref_ann")
-    t_bid = st.toggle("Bid activity (new bids, awards, RFP matches, "
-                      "due-date reminders)",
-                      value=profile.get("notify_bid_activity", True) is not False,
-                      key="pref_bid")
-    t_msg = st.toggle("Bid Q&A messages",
-                      value=profile.get("notify_messages", True) is not False,
-                      key="pref_msg")
-    if st.button("Save notification settings"):
-        upd = {"email_opt_out": not t_ann,
-               "notify_bid_activity": t_bid,
-               "notify_messages": t_msg}
-        sb().table("profiles").update(upd).eq(
-            "id", st.session_state.user_id).execute()
-        st.session_state.profile = {**profile, **upd}
-        st.success("Notification settings saved.")
-        st.rerun()
-
-    st.markdown('<div class="eyebrow" style="margin-top:14px">ACCOUNT TYPE</div>', unsafe_allow_html=True)
-    with st.expander("Wrong role? Switch account type"):
-        other = "Subcontractor" if profile["role"] == "gc" else "General Contractor"
-        st.markdown(f'<div style="color:{C["inkSoft"]};font-size:14px">'
-                    f'Your account is set up as a '
-                    f'**{"General Contractor" if profile["role"] == "gc" else "Subcontractor"}**. '
-                    f'Switching changes which tools you see — your existing '
-                    f'data stays in the system.</div>',
-                    unsafe_allow_html=True)
-        sure = st.checkbox(f"I understand — switch me to {other}",
-                           key="role_switch_confirm")
-        if st.button(f"Switch to {other}", key="role_switch_btn"):
-            if sure:
-                switch_role(profile,
-                            "sub" if profile["role"] == "gc" else "gc")
-            else:
-                st.error("Tick the confirmation box first.")
-
-
-    st.markdown('<div class="eyebrow" style="margin-top:14px">TRADES & SERVICE AREA</div>', unsafe_allow_html=True)
-    if profile["role"] == "sub":
-        with st.expander("🛠 Trades & service area"):
-            cur_trades = [t for t in (profile.get("trades") or [])
-                          if t in TRADES]
-            cur_states = [x for x in (profile.get("work_states") or [])
-                          if x in US_STATES]
-            new_trades = st.multiselect("Trades (CSLB classifications)",
-                                        TRADES, default=cur_trades)
-            new_states = st.multiselect("States you work in", US_STATES,
-                                        default=cur_states or ["CA"])
-            new_cities = st.text_input(
-                "Cities / areas you serve",
-                value=profile.get("work_cities") or "",
-                placeholder="e.g. San Jose, Santa Clara, Gilroy")
-            if st.button("Save trades & service area"):
-                upd = {"trades": new_trades or None,
-                       "work_states": new_states or None,
-                       "work_cities": new_cities.strip() or None,
-                       "trade": ", ".join(new_trades) or None}
-                sb().table("profiles").update(upd).eq(
-                    "id", st.session_state.user_id).execute()
-                st.session_state.profile = {**profile, **upd}
-                st.success("Saved — GCs filtering by trade and location "
-                           "will now find you.")
-                st.rerun()
-
 
 
 # ─────────────────────────────────────────────────────────────────────
